@@ -76,38 +76,43 @@
         e))))
 
 (defn keyslot-specs [cluster coll]
-  (into {}  (for [[request e] coll
-                  :let [[slot host port] (parse-redirect (.getMessage ^Exception e))]]
-              [slot {:host host :port port :cluster cluster}])))
+  (into {} (for [[request e] coll
+                 :let [[slot host port] (parse-redirect (.getMessage ^Exception e))]]
+             [slot {:host host :port port :cluster cluster}])))
 
-(defn execute-requests [conn get-replies? replies-as-pipeline? requests]
-  (let [cluster     (get-in conn [:spec :cluster])
+(defn- unpack [responses err]
+  (let [ungrouped (group-by (comp retryable? last)
+                            (for [[requests p] responses
+                                  [request response] (map vector requests (deref p 5000 err))]
+                              [request response]))]
+    [(get ungrouped true) (get ungrouped false)]))
+
+(defn execute-requests [conn requests get-replies? replies-as-pipeline?]
+  (let [nreqs       (count requests)
+        cluster     (get-in conn [:spec :cluster])
         requests    (map-indexed #(vary-meta %2 assoc :pos %1 :expected-keyslot (commands/keyslot (second %2))) requests) ;; comes through as nil?, temporary fix
-        group-fn    (fn [request] (find-spec (deref cached-keyslot-conn-specs) (:expected-keyslot (meta request)) conn))
+        group-fn    (fn [request]
+                      (find-spec (deref cached-keyslot-conn-specs) (:expected-keyslot (meta request)) conn))
         placeholder (java.util.concurrent.TimeoutException.)]
 
-    (loop [plan         (group-by group-fn requests)
-           final-result (vec (repeat (count requests) placeholder))
-           n            0]
-      (let [responses    (for [[spec reqs] plan]
-                           [reqs (future (if (> (count reqs) 1)
-                                           (send-request {:spec spec} reqs get-replies? replies-as-pipeline?)
-                                           [(send-request {:spec spec} reqs get-replies? replies-as-pipeline?)]))])
-            ungrouped    (group-by (comp retryable? last) (for [[requests p] responses
-                                                                [request response] (map vector requests (deref p 5000 placeholder))]
-                                                            [request response]))
-            remaining    (get ungrouped true)
-            done         (get ungrouped false)
-            final-result (reduce (fn [coll [request response]]
-                                   (assoc coll (:pos (meta request)) response))
-                                 final-result
-                                 done)]
+    (loop [plan   (group-by group-fn requests)
+           result (vec (repeat nreqs placeholder))
+           n      0]
+      (let [responses (for [[spec reqs] plan]
+                        [reqs (future (if (> (count reqs) 1)
+                                        (send-request {:spec spec} reqs get-replies? replies-as-pipeline?)
+                                        [(send-request {:spec spec} reqs get-replies? replies-as-pipeline?)]))])
+            [remaining done] (unpack responses placeholder)
+            result (reduce (fn [coll [request response]]
+                             (assoc coll (:pos (meta request)) response))
+                           result
+                           done)]
 
         (swap! cached-keyslot-conn-specs update-in [cluster] merge (keyslot-specs cluster remaining))
 
-        (if (and (seq remaining) (< n max-retries))
-          (recur (group-by group-fn (map first remaining)) final-result (inc n))
-          final-result)))))
+        (cond (and (seq remaining) (< n max-retries)) (recur (group-by group-fn (map first remaining)) result (inc n))
+              (> nreqs 1) result
+              :else (first result))))))
 
 (comment ; Example
 
