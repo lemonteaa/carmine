@@ -7,12 +7,26 @@
   (:import  [java.io DataInputStream BufferedOutputStream]
             [clojure.lang Keyword]))
 
+;;; Outline (Carmine v3+)
+;; * Dynamic context is established with `carmine/wcar`.
+;; * Commands executed w/in this context push their requests (vectors) into
+;;   context's request queue. Requests may have metadata for Cluster keyslots &
+;;   parsers. Parsers may have metadata as a convenient+composable way of
+;;   communicating special request requirements (:raw-bulk?, :thaw-opts, etc.).
+;; * On `with-reply`, nested `wcar`, or `execute-requests` - queued requests
+;;   will actually be sent to server as pipeline.
+;; * For non-listener modes, corresponding replies will then immediately be
+;;   received, parsed, + returned.
+
 ;;;; Dynamic context
+
+;(encore/declare-remote taoensso.carmine.cluster/execute-requests)
 
 (deftype EnqueuedRequest [^long cluster-keyslot parser args bs-args #_opts])
 (defrecord Context [conn req-queue_ #_parser #_req-opts])
 (def ^:dynamic *context* "Current dynamic Context"         nil)
 (def ^:dynamic *parser*  "ifn (with optional meta) or nil" nil)
+
 (def no-context-ex
   (ex-info "Redis commands must be called within the context of a connection to Redis server (see `wcar`)" {}))
 

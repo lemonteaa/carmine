@@ -10,151 +10,251 @@
              (commands    :as commands)]))
 
 
-(utils/defalias parse        protocol/parse)
-(utils/defalias with-replies protocol/with-replies)
+;; TODO Migrate to new design
 
-(def hash-slots 16384)
+;;; Description of new design:
+;; The new design should be significantly more flexible + performant for use
+;; with Cluster:
+;; * `protocol/*context*` now contains a request queue (atom []).
+;; * Redis commands previously wrote directly to io buffer, they now push
+;;   'requests' to this queue instead.
+;; * A 'request' looks like ["GET" "my-key" "my-val"] and has optional
+;;   metadata which includes `:expected-keyslot` - hashed cluster key (crc16).
+;;
+;; * Request pushing + metadata is all handled by `commands/enqueue-request`.
+;;
+;; * Before actually fetching server replies, all queued requests are written to
+;;   io buffer with `protocol/execute-requests`.
+;;
+;; * This fn works with dynamic arguments (default), or with an explicit
+;;   Connection and requests. It is fast + flexible (gives us a lot of room to
+;;   make Cluster-specific adjustments).
 
-(def ^"[J" xmodem-crc16-lookup
-  (long-array
-   [0x0000,0x1021,0x2042,0x3063,0x4084,0x50a5,0x60c6,0x70e7,
-    0x8108,0x9129,0xa14a,0xb16b,0xc18c,0xd1ad,0xe1ce,0xf1ef,
-    0x1231,0x0210,0x3273,0x2252,0x52b5,0x4294,0x72f7,0x62d6,
-    0x9339,0x8318,0xb37b,0xa35a,0xd3bd,0xc39c,0xf3ff,0xe3de,
-    0x2462,0x3443,0x0420,0x1401,0x64e6,0x74c7,0x44a4,0x5485,
-    0xa56a,0xb54b,0x8528,0x9509,0xe5ee,0xf5cf,0xc5ac,0xd58d,
-    0x3653,0x2672,0x1611,0x0630,0x76d7,0x66f6,0x5695,0x46b4,
-    0xb75b,0xa77a,0x9719,0x8738,0xf7df,0xe7fe,0xd79d,0xc7bc,
-    0x48c4,0x58e5,0x6886,0x78a7,0x0840,0x1861,0x2802,0x3823,
-    0xc9cc,0xd9ed,0xe98e,0xf9af,0x8948,0x9969,0xa90a,0xb92b,
-    0x5af5,0x4ad4,0x7ab7,0x6a96,0x1a71,0x0a50,0x3a33,0x2a12,
-    0xdbfd,0xcbdc,0xfbbf,0xeb9e,0x9b79,0x8b58,0xbb3b,0xab1a,
-    0x6ca6,0x7c87,0x4ce4,0x5cc5,0x2c22,0x3c03,0x0c60,0x1c41,
-    0xedae,0xfd8f,0xcdec,0xddcd,0xad2a,0xbd0b,0x8d68,0x9d49,
-    0x7e97,0x6eb6,0x5ed5,0x4ef4,0x3e13,0x2e32,0x1e51,0x0e70,
-    0xff9f,0xefbe,0xdfdd,0xcffc,0xbf1b,0xaf3a,0x9f59,0x8f78,
-    0x9188,0x81a9,0xb1ca,0xa1eb,0xd10c,0xc12d,0xf14e,0xe16f,
-    0x1080,0x00a1,0x30c2,0x20e3,0x5004,0x4025,0x7046,0x6067,
-    0x83b9,0x9398,0xa3fb,0xb3da,0xc33d,0xd31c,0xe37f,0xf35e,
-    0x02b1,0x1290,0x22f3,0x32d2,0x4235,0x5214,0x6277,0x7256,
-    0xb5ea,0xa5cb,0x95a8,0x8589,0xf56e,0xe54f,0xd52c,0xc50d,
-    0x34e2,0x24c3,0x14a0,0x0481,0x7466,0x6447,0x5424,0x4405,
-    0xa7db,0xb7fa,0x8799,0x97b8,0xe75f,0xf77e,0xc71d,0xd73c,
-    0x26d3,0x36f2,0x0691,0x16b0,0x6657,0x7676,0x4615,0x5634,
-    0xd94c,0xc96d,0xf90e,0xe92f,0x99c8,0x89e9,0xb98a,0xa9ab,
-    0x5844,0x4865,0x7806,0x6827,0x18c0,0x08e1,0x3882,0x28a3,
-    0xcb7d,0xdb5c,0xeb3f,0xfb1e,0x8bf9,0x9bd8,0xabbb,0xbb9a,
-    0x4a75,0x5a54,0x6a37,0x7a16,0x0af1,0x1ad0,0x2ab3,0x3a92,
-    0xfd2e,0xed0f,0xdd6c,0xcd4d,0xbdaa,0xad8b,0x9de8,0x8dc9,
-    0x7c26,0x6c07,0x5c64,0x4c45,0x3ca2,0x2c83,0x1ce0,0x0cc1,
-    0xef1f,0xff3e,0xcf5d,0xdf7c,0xaf9b,0xbfba,0x8fd9,0x9ff8,
-    0x6e17,0x7e36,0x4e55,0x5e74,0x2e93,0x3eb2,0x0ed1,0x1ef0]))
+;;; Sketch of suggested implementation:
+;; * `:cluster` should be provided as part of connection :spec options.
+;; * The `protocol/execute-requests` fn could be modded so that when the
+;;   :cluster key is present, behaviour is delegated to
+;;   `cluster/execute-requests`.
+;; * This fn groups requests by the (cached) keyslot->server info:
+;;   (let [plan (group-by <grouping-fn> requests)]
+;;    <...>).
+;; * Futures can then call `protocol/execute-requests` with the explicit
+;;   expected connections + planned requests & deliver replies to promises.
+;; * All Cluster replies could be inspected for Cluster errors like MOVE, etc.
+;;   This is easier than before since exceptions now have
+;;   `(ex-data <ex>)` with a :prefix key that'll be :moved, :ack, :wrongtype, etc.
+;; * After all promises have returned, we could regroup for any moved keys and
+;;   loop, continuing to accumulate appropriate replies.
+;; * We eventually return all the replies in the same order they were provided.
+;;   Parsers & other goodies will just work as expected since all that info is
+;;   attached to the requests themselves.
 
-(defn crc16
-  "CRC16 algorithm used by Redis Cluster."
-  [^String s]
-  (let [bytes (.getBytes s)
-        len   (alength bytes)]
-    (loop [n   0
-           crc 0]
-      (if (>= n len)
-        crc
-        (recur (inc n)
-               (bit-xor (bit-and (bit-shift-left crc 8) 0xffff)
-                        (aget xmodem-crc16-lookup
-                              (-> (bit-shift-right crc 8)
-                                  (bit-xor (aget bytes n))
-                                  (bit-and 0xff)))))))))
+;; {<name> {<keyslot> <conn-spec>}}
+(def ^:private cached-keyslot-conn-specs (atom {}))
 
-(defn keyslot
-  "Calculates the keyslot of a given String."
-  [s]
-  (mod (crc16 s) hash-slots))
+(defn retryable? [obj]
+  (= (:prefix (ex-data obj)) :moved))
 
-(def ^:dynamic *conn* nil)
+(def max-retries 14)
 
-(def ^:private slot-cache (atom {}))
+(defn parse-redirect [msg]
+  (let [[_ slot addr] (str/split msg #" ")]
+    (when-let [[host port] (str/split addr #":")]
+      [(encore/as-int slot) host (encore/as-int port)])))
 
-(defn cached-conn [cluster key]
-  (get-in @slot-cache [cluster (keyslot key)]))
+(defn find-spec [m slot conn]
+  (get-in m [(get-in conn [:spec :cluster]) slot] (:spec conn)))
 
-(defn replace-conn! [cluster slot spec]
-  (get-in (swap! slot-cache assoc-in [cluster slot] {:spec spec :cluster cluster})
-          [cluster slot]))
+(defn send-request [conn-opts requests get-replies? replies-as-pipeline?]
+  (let [[pool conn] (conns/pooled-conn conn-opts)]
+    (try
+      (let [response (protocol/execute-requests conn requests get-replies? replies-as-pipeline?)]
+        (conns/release-conn pool conn)
+        response)
+      (catch Exception e
+        (conns/release-conn pool conn e)
+        e))))
 
-(defn parse-spec [addr]
-  (let [[host port] (str/split addr #":")
-        bound-spec  (get-in protocol/*context* [:conn :spec])]
-    (if (str/blank? host)
-      bound-spec
-      (merge bound-spec {:host host :port (car/as-long port)}))))
+(defn keyslot-specs [cluster coll]
+  (into {}  (for [[request e] coll
+                  :let [[slot host port] (parse-redirect (.getMessage ^Exception e))]]
+              [slot {:host host :port port :cluster cluster}])))
 
-(defn parse-redirect [error]
-  (let [[error slot address] (str/split error #" ")]
-    [(car/as-long slot) (parse-spec address)]))
+(defn execute-requests [conn get-replies? replies-as-pipeline? requests]
+  (let [cluster     (get-in conn [:spec :cluster])
+        requests    (map-indexed #(vary-meta %2 assoc :pos %1 :expected-keyslot (commands/keyslot (second %2))) requests) ;; comes through as nil?, temporary fix
+        group-fn    (fn [request] (find-spec (deref cached-keyslot-conn-specs) (:expected-keyslot (meta request)) conn))
+        placeholder (java.util.concurrent.TimeoutException.)]
 
-(defn moved? [^Exception exception]
-  (if-let [error (.getMessage exception)]
-    (.startsWith error "MOVED")
-    false))
+    (loop [plan         (group-by group-fn requests)
+           final-result (vec (repeat (count requests) placeholder))
+           n            0]
+      (let [responses    (for [[spec reqs] plan]
+                           [reqs (future (if (> (count reqs) 1)
+                                           (send-request {:spec spec} reqs get-replies? replies-as-pipeline?)
+                                           [(send-request {:spec spec} reqs get-replies? replies-as-pipeline?)]))])
+            ungrouped    (group-by (comp retryable? last) (for [[requests p] responses
+                                                                [request response] (map vector requests (deref p 5000 placeholder))]
+                                                            [request response]))
+            remaining    (get ungrouped true)
+            done         (get ungrouped false)
+            final-result (reduce (fn [coll [request response]]
+                                   (assoc coll (:pos (meta request)) response))
+                                 final-result
+                                 done)]
 
-(defn try-request [conn args]
-  (try
-    (car/wcar conn (protocol/send-request* args))
-    (catch Exception e e)))
+        (swap! cached-keyslot-conn-specs update-in [cluster] merge (keyslot-specs cluster remaining))
 
-(defn send-request*
-  "Sends a request to a Redis Cluster, follow redirects if the key has moved."
-  [args]
-  (let [cluster (:cluster *conn*)]
-    (loop [redirects 0
-           conn      *conn*]
-      (let [response (try-request (or (cached-conn cluster (second args)) *conn*) args)]
-        (cond (not (instance? Exception response)) response
-              (> redirects 15) (Exception. "too many cluster redirects")
-              (moved? response) (recur (inc redirects) (apply replace-conn! cluster (parse-redirect (.getMessage ^Exception response))))
-              :else
-              response)))))
+        (if (and (seq remaining) (< n max-retries))
+          (recur (group-by group-fn (map first remaining)) final-result (inc n))
+          final-result)))))
 
-(defmacro ccar
-  "Evaluates body in the context of multiple thread-bound pooled connections to Redis
-  cluster. Sends Redis commands to server as pipeline and returns the server's
-  response. Releases connection back to pool when done.
+(comment ; Example
 
-  `conn` arg is a map with connection pool, spec and cluster options:
-    {:pool {} :spec {:host \"127.0.0.1\" :port 7000} :cluster \"my-cluster\"}"
-  {:arglists '([conn :as-pipeline & body] [conn & body])}
-  [conn & sigs]
-  `(binding [protocol/send-request send-request*
-             *conn* ~conn]
-     (vector ~@sigs)))
+  ;; Step 1:
+  (car/wcar {:spec {:host "127.0.0.1" :port 7001 :cluster "foo"}}
+    (car/get "key-a")
+    (car/get "key-b")
+    (car/get "key-c"))
 
-(comment (ccar {:spec {:host "127.0.0.1" :port 7001} :cluster "my-cluster"} (car/get "foo")))
+  (car/wcar {:spec {:host "127.0.0.1" :port 7002 :cluster "foo"}}
+    (car/get "key-f")
+    (car/get "key-a")
+    (car/get "key-b")
+    (car/get "key-l"))
 
-(defn parse-slots [s]
-  (when-not (re-find #"^\[" s)
-    (let [[start stop] (str/split s #"-")
-          stop         (or stop start)]
-      [(car/as-long start) (car/as-long stop)])))
+  (time (dotimes [n 1000]
+          (car/wcar {:spec {:host "127.0.0.1" :port 7001 :cluster "foo"}}
+            (doseq [n (range 100)]
+              (car/get (str "key-" n))))))
 
-(defn parse-cluster-node [s]
-  (let [fields (str/split s #" ")
-        [name addr flags master-id ping-sent ping-recv config-epoch link-status & slots] fields
-        spec (parse-spec addr)]
-    {:spec      (parse-spec addr)
-     :slots     (map parse-slots slots)
-     :flags     (set (map keyword (str/split flags #",")))
-     :replicate (if (= master-id "-") false master-id)
-     :ping-sent (car/as-long ping-sent)
-     :ping-recv (car/as-long ping-recv)}))
+  ;; Step 2:
+  ;; protocol/execute-requests will receive requests as:
+  ;; [["GET" "key-a"] ["GET" "key-b"] ["GET" "key-c"]]
+  ;; Each will have :expected-keyslot metadata.
+  ;; None have :parser metadata in this case, but it wouldn't make a difference
+  ;; to our handling here.
 
-(defn cluster-nodes*
-  "Queries the current list of cluster nodes."
-  []
-  (->> (protocol/send-request [:cluster :nodes])
-       (parse
-        (fn [reply]
-          (mapv parse-cluster-node (str/split-lines reply))))))
+  ;; Step 3:
+  ;; Does our cache know which servers serve each of the above slots?[1]
+  ;; Group requests per server + `execute-requests` in parallel with
+  ;; appropriate Connections specified (will override the dynamic args).
+
+  ;; Step 4:
+  ;; Wait for all promises to be fulfilled (a timeout may be sensible).
+
+  ;; Step 5:
+  ;; Identify (with `(:prefix (ex-data <ex>))`) which replies are Cluster/timeout
+  ;; errors that imply we should try again.
+
+  ;; Step 6:
+  ;; Continue looping like this until we've got all expected replies or we're
+  ;; giving up for certain replies.
+
+  ;; Step 7:
+  ;; Return all replies in order as a single vector (i.e. the consumer won't be
+  ;; aware which nodes served which replies).
+
+  ;; [1]
+  ;; Since slots are distributed to servers in _ranges_, we can do this quite
+  ;; efficiently.
+  ;; Let's say we request a key at slot 42 and determine that it's at
+  ;; 127.0.0.1:6379 so we cache {42 <server 127.0.0.1:6379>}.
+  ;;
+  ;; Now we want a key at slot 78 but we have no idea where it is. We can scan
+  ;; our cache and find the nearest known slot to 78 and use that for our first
+  ;; attempt. So with n nodes, we'll have at most n-1 expected-slot misses.
+  )
+
+;;; Older iteration, seems to still have some useful pieces that can be referenced.
+(comment
+
+	(def ^:dynamic *conn* nil)
+
+	(def ^:private slot-cache (atom {}))
+
+	(defn cached-conn [cluster key]
+	  (get-in @slot-cache [cluster (keyslot key)]))
+
+	(defn replace-conn! [cluster slot spec]
+	  (get-in (swap! slot-cache assoc-in [cluster slot] {:spec spec :cluster cluster})
+			  [cluster slot]))
+
+	(defn parse-spec [addr]
+	  (let [[host port] (str/split addr #":")
+			bound-spec  (get-in protocol/*context* [:conn :spec])]
+		(if (str/blank? host)
+		  bound-spec
+		  (merge bound-spec {:host host :port (car/as-long port)}))))
+
+	(defn parse-redirect [error]
+	  (let [[error slot address] (str/split error #" ")]
+		[(car/as-long slot) (parse-spec address)]))
+
+	(defn moved? [^Exception exception]
+	  (if-let [error (.getMessage exception)]
+		(.startsWith error "MOVED")
+		false))
+
+	(defn try-request [conn args]
+	  (try
+		(car/wcar conn (protocol/send-request* args))
+		(catch Exception e e)))
+
+	(defn send-request*
+	  "Sends a request to a Redis Cluster, follow redirects if the key has moved."
+	  [args]
+	  (let [cluster (:cluster *conn*)]
+		(loop [redirects 0
+			   conn      *conn*]
+		  (let [response (try-request (or (cached-conn cluster (second args)) *conn*) args)]
+			(cond (not (instance? Exception response)) response
+				  (> redirects 15) (Exception. "too many cluster redirects")
+				  (moved? response) (recur (inc redirects) (apply replace-conn! cluster (parse-redirect (.getMessage ^Exception response))))
+				  :else
+				  response)))))
+
+	(defmacro ccar
+	  "Evaluates body in the context of multiple thread-bound pooled connections to Redis
+	  cluster. Sends Redis commands to server as pipeline and returns the server's
+	  response. Releases connection back to pool when done.
+
+	  `conn` arg is a map with connection pool, spec and cluster options:
+		{:pool {} :spec {:host \"127.0.0.1\" :port 7000} :cluster \"my-cluster\"}"
+	  {:arglists '([conn :as-pipeline & body] [conn & body])}
+	  [conn & sigs]
+	  `(binding [protocol/send-request send-request*
+				 *conn* ~conn]
+		 (vector ~@sigs)))
+
+	(comment (ccar {:spec {:host "127.0.0.1" :port 7001} :cluster "my-cluster"} (car/get "foo")))
+
+	(defn parse-slots [s]
+	  (when-not (re-find #"^\[" s)
+		(let [[start stop] (str/split s #"-")
+			  stop         (or stop start)]
+		  [(car/as-long start) (car/as-long stop)])))
+
+	(defn parse-cluster-node [s]
+	  (let [fields (str/split s #" ")
+			[name addr flags master-id ping-sent ping-recv config-epoch link-status & slots] fields
+			spec (parse-spec addr)]
+		{:spec      (parse-spec addr)
+		 :slots     (map parse-slots slots)
+		 :flags     (set (map keyword (str/split flags #",")))
+		 :replicate (if (= master-id "-") false master-id)
+		 :ping-sent (car/as-long ping-sent)
+		 :ping-recv (car/as-long ping-recv)}))
+
+	(defn cluster-nodes*
+	  "Queries the current list of cluster nodes."
+	  []
+	  (->> (protocol/send-request [:cluster :nodes])
+		   (parse
+			(fn [reply]
+			  (mapv parse-cluster-node (str/split-lines reply))))))
 
 
-(comment (clojure.pprint/pprint (car/wcar {:spec {:host "127.0.0.1" :port 7000 :stuff "here"}} (cluster-nodes*))))
+	(comment (clojure.pprint/pprint (car/wcar {:spec {:host "127.0.0.1" :port 7000 :stuff "here"}} (cluster-nodes*))))
+
+)
