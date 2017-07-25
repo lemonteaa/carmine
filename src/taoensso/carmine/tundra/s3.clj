@@ -3,8 +3,8 @@
   {:author "Peter Taoussanis"}
   (:require [clojure.string          :as str]
             [aws.sdk.s3              :as s3]
+            [taoensso.encore         :as enc :refer (have? have)]
             [taoensso.timbre         :as timbre]
-            [taoensso.carmine.utils  :as utils]
             [taoensso.carmine.tundra :as tundra])
   (:import  [java.io ByteArrayInputStream DataInputStream]
             [taoensso.carmine.tundra IDataStore]
@@ -17,7 +17,7 @@
 (defrecord S3DataStore [creds bucket]
   IDataStore
   (put-key [this k v]
-    (assert (utils/bytes? v))
+    (have? enc/bytes? v)
     (let [reply (try (s3/put-object creds bucket k (ByteArrayInputStream. v)
                        {:content-length (count v)
                         ;; Nb! Prevents overwriting with corrupted data:
@@ -32,16 +32,20 @@
          (s3/create-bucket creds bucket)
          (recur k v))
        (instance? Exception reply) reply
-       :else (Exception. (format "Unexpected reply: %s" reply)))))
+       :else (ex-info (format "Unexpected reply: %s" reply) {:reply reply}))))
 
   (fetch-keys [this ks]
     (let [fetch1
           (fn [k]
             (tundra/catcht
-             (let [obj (s3/get-object creds bucket k)
-                   ba  (byte-array (-> obj :metadata :content-length))]
-               (.readFully (DataInputStream. (:content obj)) ba)
-               ba)))]
+              (let [obj (s3/get-object creds bucket k)]
+                (with-open
+                    [^com.amazonaws.services.s3.model.S3ObjectInputStream cnt
+                     (:content obj)]
+                  (let [ba (byte-array (enc/have enc/pos-int?
+                                         (-> obj :metadata :content-length)))]
+                    (.readFully (DataInputStream. cnt) ba)
+                    ba)))))]
       (->> (mapv #(future (fetch1 %)) ks)
            (mapv deref)))))
 
@@ -54,10 +58,10 @@
 
   Supported Freezer io types: byte[]s."
   [creds bucket] {:pre [(string? bucket)]}
-  (->S3DataStore creds bucket))
+  (S3DataStore. creds bucket))
 
 (comment
   (def dstore  (s3-datastore creds "ensso-store/folder"))
-  (def hardkey (tundra/>safe-keyname "foo:bar /♡\\:baz "))
+  (def hardkey (tundra/>urlsafe-str "00temp-test-foo:bar /♡\\:baz "))
   (tundra/put-key dstore hardkey (.getBytes "hello world"))
   (String. (first (tundra/fetch-keys dstore [hardkey]))))

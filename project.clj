@@ -1,41 +1,53 @@
-(defproject com.taoensso/carmine "2.4.6"
+(defproject com.taoensso/carmine "2.16.0"
+  :author "Peter Taoussanis <https://www.taoensso.com>"
   :description "Clojure Redis client & message queue"
   :url "https://github.com/ptaoussanis/carmine"
   :license {:name "Eclipse Public License"
-            :url  "http://www.eclipse.org/legal/epl-v10.html"}
-  :dependencies [[org.clojure/clojure         "1.4.0"]
-                 [org.clojure/tools.macro     "0.1.5"]
-                 [commons-pool/commons-pool   "1.6"]
-                 [commons-codec/commons-codec "1.9"]
-                 [org.clojure/data.json       "0.2.4"]
-                 [com.taoensso/timbre         "3.0.0"]
-                 [com.taoensso/nippy          "2.5.2"]]
-  :profiles {:1.4   {:dependencies [[org.clojure/clojure  "1.4.0"]]}
-             :1.5   {:dependencies [[org.clojure/clojure  "1.5.1"]]}
-             :1.6   {:dependencies [[org.clojure/clojure  "1.6.0-alpha2"]]}
-             :dev   {:dependencies [[ring/ring-core       "1.2.1"]
-                                    [com.taoensso/faraday "1.0.2"]]}
-             :test  {:dependencies [[expectations         "1.4.56"]
-                                    [clj-aws-s3           "0.3.7"]]}
-             :bench {:dependencies [] :jvm-opts ["-server"]}}
-  :aliases {"test-all"    ["with-profile" "+test,+1.4:+test,+1.5:+test,+1.6"
-                           "do" "test," "expectations"]
-            "test-auto"   ["with-profile" "+test" "autoexpect"]
-            "start-dev"   ["with-profile" "+dev,+test,+bench" "repl" ":headless"]
-            "start-bench" ["trampoline" "start-dev"]
-            "codox"       ["with-profile" "+test,+1.5" "doc"]}
-  :plugins [[lein-expectations "0.0.8"]
-            [lein-autoexpect   "1.2.1"]
-            [lein-ancient      "0.5.4"]
-            [codox             "0.6.6"]]
-  :min-lein-version "2.0.0"
-  :global-vars {*warn-on-reflection* true}
-  :repositories
-  {"sonatype"
-   {:url "http://oss.sonatype.org/content/repositories/releases"
-    :snapshots false
-    :releases {:checksum :fail}}
-   "sonatype-snapshots"
-   {:url "http://oss.sonatype.org/content/repositories/snapshots"
-    :snapshots true
-    :releases {:checksum :fail :update :always}}})
+            :url  "http://www.eclipse.org/legal/epl-v10.html"
+            :distribution :repo
+            :comments "Same as Clojure"}
+  :min-lein-version "2.3.3"
+  :global-vars {*warn-on-reflection* true
+                *assert* true}
+
+  :dependencies
+  [[org.clojure/clojure              "1.5.1"]
+   [com.taoensso/encore              "2.90.1"]
+   [com.taoensso/timbre              "4.8.0"]
+   [com.taoensso/nippy               "2.13.0"]
+   [org.apache.commons/commons-pool2 "2.4.2"]
+   [commons-codec/commons-codec      "1.10"]]
+
+  :profiles
+  {;; :default [:base :system :user :provided :dev]
+   :server-jvm {:jvm-opts ^:replace ["-server"]}
+   :1.5  {:dependencies [[org.clojure/clojure "1.5.1"]]}
+   :1.6  {:dependencies [[org.clojure/clojure "1.6.0"]]}
+   :1.7  {:dependencies [[org.clojure/clojure "1.7.0"]]}
+   :1.8  {:dependencies [[org.clojure/clojure "1.8.0"]]}
+   :1.9  {:dependencies [[org.clojure/clojure "1.9.0-alpha10"]]}
+   :test {:dependencies [;; 2.1.4 has breaking changes
+                         [org.clojure/test.check  "0.9.0"]
+                         [com.taoensso/faraday    "1.9.0"]
+                         [clj-aws-s3              "0.3.10"]
+                         [ring/ring-core          "1.5.1"]]}
+   :dev
+   [:1.9 :test :server-jvm
+    {:dependencies [[org.clojure/data.json "0.2.6"]]
+     :plugins
+     [[lein-ancient "0.6.10"]
+      [lein-codox   "0.10.3"]]}]}
+
+  :test-paths ["test" "src"]
+
+  :codox
+  {:language :clojure
+   :source-uri "https://github.com/ptaoussanis/carmine/blob/master/{filepath}#L{line}"}
+
+  :aliases
+  {"test-all"   ["with-profile" "+1.9:+1.8:+1.7:+1.6:+1.5" "test"]
+   "deploy-lib" ["do" "deploy" "clojars," "install"]
+   "start-dev"  ["with-profile" "+dev" "repl" ":headless"]}
+
+  :repositories {"sonatype-oss-public"
+                 "https://oss.sonatype.org/content/groups/public/"})

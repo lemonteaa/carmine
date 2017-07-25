@@ -1,28 +1,278 @@
-## v2.4.6 / 2014-Jan-31
+> This project uses [Break Versioning](https://github.com/ptaoussanis/encore/blob/master/BREAK-VERSIONING.md) as of **Aug 16, 2014**.
 
-### Fixes
- * [#71] Fix bad `atomic` arg order (neilmock).
- * [#72] Fix bad mq handler connection arg (neilmock).
+## v2.16.0 / 2017 Mar 24
+
+```clojure
+[com.taoensso/carmine "2.16.0"]
+```
+
+> This is a non-breaking maintenance release
+
+* **New**: Update Nippy to [v2.13.0](https://github.com/ptaoussanis/nippy/releases/tag/v2.13.0)
+* **New**: Update to latest Redis commands spec
+* [#192] **Fix**: `protocol/get-parsed-reply` fn (@firesofmay)
+* [#193] **Impl**: Migrate unit tests from Expectations to clojure.test (@firesofmay)
+
+## v2.15.1 / 2017 Jan 7
+
+```clojure
+[com.taoensso/carmine "2.15.1"]
+```
+
+> This is a non-breaking hotfix release
+
+* [#189] **Hotfix**: broken `redis-call`
+
+## v2.15.0 / 2016 Oct 20
+
+```clojure
+[com.taoensso/carmine "2.15.0"]
+```
+
+> This is a non-breaking maintenance release
+
+* **Fix**: message-queue errors not being correctly identified.
+* **Impl**: refactor automatic command definitions.
+* **Impl**: refactor some low-level protocol code.
+
+## v2.14.0 / 2016 Jul 24
+
+```clojure
+[com.taoensso/carmine "2.14.0"]
+```
+
+> This is a non-breaking release that upgrades Carmine's Nippy dependency
+
+* **Impl**: Switch to Nippy v2.12.0 for serialization performance improvements
+* [#174] **New**: Message queue: add `qname` to arg map passed to queue handler (@dparis)
+* [#175] **New**: Improve error message for mq handler errors
+
+## v2.13.1 / 2016 Jun 21
+
+```clojure
+[com.taoensso/carmine "2.13.1"]
+```
+
+> This is a hotfix release and **recommended upgrade** for all users of `v2.13.0`
+
+* **Fix**: Regression from v2.12.2 could cause DataInputStream errors in some cases [#173]
+
+## v2.13.0 / 2016 Jun 10
+
+```clojure
+[com.taoensso/carmine "2.13.0"]
+```
+
+> This is a **non-breaking** performance and housekeeping release
+
+* **New**: updated Redis `commands.json` (bitops, etc.)
+* **New**: added `reduce-scan` util for use with `scan`, `zscan`, etc.
+* **Impl**: refactored some core protocol + connections stuff (performance improvements)
+* **Fix**: `atomic*` was broken for non-const `max-cas-attempts` [#165 @MysteryMachine]
+* **Fix**: Message queue: catch unexpected `dequeue` errors [#87 @gsnewmark]
 
 
-## v2.4.5 / 2014-Jan-22
+## v2.12.2 / 2016 Jan 14
 
-This is a **backwards compatible bug fix release**. Recommended upgrade.
+> This is a minor, non-breaking release
 
-### Features
- * Updated `commands.json` to bring in Redis 2.8 SCAN commands.
+* **New**: Allow reclaiming resources for pub/sub on closing [#149 @mpenet]
+* **Fix**: Add missing Tundra disk store type hint
+
+```clojure
+[com.taoensso/carmine "2.12.2"]
+```
+
+
+## v2.12.1 / 2015 Nov 30
+
+* **Hotfix**: broken Faraday data store for Tundra [#147]
+
+```clojure
+[com.taoensso/carmine "2.12.1"]
+```
+
+
+## v2.12.0 / 2015 Sep 30
+
+> This is a significant **feature release** focused on new CAS utils
+
+* **New**: conn spec URIs now support /db path [#113 @olek]
+* **New**: `with-replies` now supports nesting
+* **New**: added experimental CAS utils: `swap`, `hswap`
+* **New**: updated commands.json (2015 Aug 5)
+* **Perf**: bumped Nippy dependency to v2.10.0
+* **Perf**: minor low-level Redis protocol optimizations
+* **Fix**: Tundra S3 datastore wasn't closing input stream
+* **Docs**: `wcar` docstring now has a warning re: laziness [#138]
+
+```clojure
+[com.taoensso/carmine "2.12.0"]
+```
+
+
+## v2.11.1 / 2015 June 5
+
+> This is a non-breaking hotfix release
+
+* **Fix**: message queue workers use 2 conns when they only need 1 [#135 @gfredericks]
+
+```clojure
+[com.taoensso/carmine "2.11.1"]
+```
+
+
+## v2.11.0 / 2015 June 4
+
+> This is a non-breaking maintenance release
+
+* **Performance**: upgrade to Nippy v2.9.0
+* **New**: update Redis commands.json (May 29)
+* **Fix**: commons-pool losing connections over time [#127 @cespare]
+* **Fix**: Tundra disk store endless loop when failing to create ouput dir
+* **Misc**: bump dependencies (incl. Encore + Faraday)
+
+```clojure
+[com.taoensso/carmine "2.11.0"]
+```
+
+
+## v2.10.0 / 2015 May 6
+
+> This is a non-breaking performance release
+
+* **Implementation**: switch `doseq` -> (faster) `run!` calls
+
+```clojure
+[com.taoensso/carmine "2.10.0"]
+```
+
+
+## v2.9.2 / 2015 Apr 1
+
+> This is a non-breaking hotfix release
+
+* **Fix**: fragile `make-new-connection` destructuring [@chairmanwow @mavbozo #130]
+* **New**: `return` can now take multiple args
+
+```clojure
+[com.taoensso/carmine "2.9.2"]
+```
+
+
+## v2.9.1 / 2015 Mar 26
+
+> This is a non-breaking hotfix release
+
+* **Fix**: `atomic` no longer masks pre-discard exceptions
+
+```clojure
+[com.taoensso/carmine "2.9.1"]
+```
+
+
+## v2.9.0 / 2014 Dec 11
+
+> This release adds more control over connection timeouts and introduces a default (4 second) timeout for _acquiring_ a connection.
+
+ * **CHANGE**: Cleaned up Listener docstrings.
+ * **NEW** [#120]: Connection specs now support `:read-timeout-ms` and `:conn-timeout-ms` (the latter defaults to 4 seconds).
+
+
+## v2.8.0 / 2014 Nov 23
+
+> This is a major but backwards-compatible update focused on performance tuning + general housekeeping.
+
+ * **CHANGE** **NB**: Upgraded to Nippy v2.7.0 for serialized data perf+size improvements. See Nippy's [changelog](https://github.com/ptaoussanis/nippy/releases/tag/v2.7.0-RC1) for details.
+ * **CHANGE**: Lua scripts are now separated from Clojure code for syntax highlighting + easier debugging.
+ * **CHANGE** [#108]: result stashing (notably Lua scripts) now uses one less TCP roundtrip.
+ * **CHANGE**: `compare-and-set` optimization: now uses hashing for all arg types.
+ * **NEW** [#106]: Experimental: conn specs can now take a `:conn-setup-fn` option (useful for pre-loading Lua scripts, etc.).
+ * **NEW** [#107]: Experimental: reply suppression via `parse-suppress` (useful with `atomic`, etc.).
+ * **NEW**: Updated to latest [commands.json](https://github.com/antirez/redis-doc/blob/master/commands.json) (2014, Oct 8).
+
+
+## v2.7.1 / 2014 Oct 4
+
+ * **NEW**: Experimental `compare-and-set` fn.
+
+
+## v2.7.0 / 2014 Aug 27
+
+> This is a significant release that **may be breaking** for those using custom connection pool options.
+
+ * **POSSIBLY BREAKING**: Upgraded to apache-commons-pool v2, bumped default max active conns (8->16). If you're using custom connection pool options, please confirm that none of your options have been removed in v2 (an exception will be thrown for invalid options).
+ * **CHANGE**: New lock-free connection pool cache (improved performance under contention).
+ * **CHANGE**: All `Exception`s are now `ExceptionInfo`s.
+ * **CHANGE**: `wcar, `atomic*`, `atomic` now catch `Throwable`s rather than `Exception`s (assertions in particular).
+ * **NEW**: New commands! (Updated official commands.json spec).
+ * **NEW**: Added `atomic*` (alpha) low-level transactions util (#93).
+
+## v2.6.2 / 2014 May 3
+
+> This is a hotfix release.
+
+ * [#84] **FIX** empty-string writes (they were throwing exceptions) (@bzg).
+
+
+## v2.6.1 / 2014 May 1
+
+> This is an **important fix release**, please update from `v2.6.0` ASAP.
+
+ * [#83] Nb **FIX** unnecessary serialization of binary arguments (@mishok13).
+
+
+## v2.6.0 / 2014 Apr 1
+
+> Adds support for new [HyperLogLog](http://antirez.com/news/75) commands (currently requires a Redis >=2.8.9 client).
+
+ * Updated official commands.json spec.
+ * Bumped `Encore` dependency.
+
+
+## v2.5.0 / 2014 Mar 30
+
+> **Major, backwards-compatible release** that refactors a lot of internal code for performance, reliability, and as groundwork for an upcoming v3 with Redis Cluster support.
 
 ### Changes
- None
+
+ * Moved most utils to external `encore` dependency.
+ * **DEPRECATED**: `as-long`, `as-double`, `parse-long`, `parse-double` -> `as-int`, `as-float`, `parse-int`, `parse-float`.
+ * Completely refactored protocol design in prep for Redis Cluster support.
+ * Misc performance & reliability improvements.
 
 ### Fixes
- * [#68] Pub/Sub bug preventing use with passwords & db selects (sritchie).
- * [unreported] `as-map` (and by extension `parse-map`) post condition bug: should allow nils.
- * [unreported] `lua-local` vector-args bug.
- * [unreported] fix Tundra message queue name formatting.
- * [#70] fix `lua` + `parse-raw` support (chenfisher).
- * [#71] message queue workers no longer terminate on errors (notably connection errors) but will retry after backoff.
- * [unreported] fix regression introduced by #70.
+
+ * Fix atomic regression (c9ca09d40).
+ * Fix broken Tundra tests, improve test reliability.
+ * Fix `atomic` exception handling (wasn't throwing swap exceptions as it should).
+
+
+## v2.4.6 / 2014 Jan 31
+
+### Fixes
+
+ * #71 Fix bad `atomic` arg order (neilmock).
+ * #72 Fix bad mq handler connection arg (neilmock).
+
+
+## v2.4.5 / 2014 Jan 22
+
+> This is a **backwards compatible bug fix release**. Recommended upgrade.
+
+### New
+
+ * Updated `commands.json` to bring in Redis 2.8 SCAN commands.
+
+### Fixes
+
+ * #68 Pub/Sub bug preventing use with passwords & db selects (sritchie).
+ * `as-map` (and by extension `parse-map`) post condition bug: should allow nils.
+ * `lua-local` vector-args bug.
+ * Fix Tundra message queue name formatting.
+ * Fix `lua` + `parse-raw` support (chenfisher).
+ * #71 Message queue workers no longer terminate on errors (notably connection errors) but will retry after backoff.
+ * Fix regression introduced by #70.
 
 
 ## v2.3.1 → v2.4.0 (major update!)
@@ -98,7 +348,7 @@ This is a **backwards compatible bug fix release**. Recommended upgrade.
 ## v1.12.0 → v2.0.0
 
   * Refactored a bunch of code for simplicity+performance (~20% improved roundtrip times).
-  * Upgraded to [Nippy v2][Nippy GitHub] for pluggable compression+crypto. See the [Nippy CHANGELOG][] for details.
+  * Upgraded to [Nippy v2](https://github.com/ptaoussanis/nippy) for pluggable compression+crypto. See the [Nippy CHANGELOG](https://github.com/ptaoussanis/carmine/commits/master) for details.
   * Added early (alpha) Tundra API for semi-automatic cold data archiving. See the [README](https://github.com/ptaoussanis/carmine#tundra) for details.
 
   * **DEPRECATED**: `with-conn`, `make-conn-pool`, `make-conn-spec` -> `wcar`:
@@ -200,12 +450,3 @@ This is a **backwards compatible bug fix release**. Recommended upgrade.
 
   * Clean up Pub/sub listener thread (don't keep head!).
   * Add URI support to `make-conn-spec`.
-
-
-### For older versions please see the [commit history][]
-
-[commit history]: https://github.com/ptaoussanis/carmine/commits/master
-[API docs]: http://ptaoussanis.github.io/carmine
-[Taoensso libs]: https://www.taoensso.com/clojure-libraries
-[Nippy GitHub]: https://github.com/ptaoussanis/nippy
-[Nippy CHANGELOG]: https://github.com/ptaoussanis/nippy/blob/master/CHANGELOG.md

@@ -1,170 +1,227 @@
 (ns taoensso.carmine.protocol
-  "Facilities for actually communicating with Redis server using its
-  request/response protocol. Originally adapted from Accession.
-
-  Ref: http://redis.io/topics/protocol"
-  {:author "Peter Taoussanis"}
-  (:require [clojure.string         :as str]
-            [taoensso.carmine.utils :as utils]
-            [taoensso.nippy.tools   :as nippy-tools])
+  "Core facilities for communicating with Redis servers using the Redis
+  request/response protocol, Ref. http://redis.io/topics/protocol."
+  (:require [clojure.string       :as str]
+            [taoensso.encore      :as enc]
+            [taoensso.nippy.tools :as nippy-tools])
   (:import  [java.io DataInputStream BufferedOutputStream]
             [clojure.lang Keyword]))
 
-(defrecord Context [conn in-stream out-stream parser-queue])
-(def ^:dynamic *context* nil)
-(def ^:dynamic *parser*  nil)
-(def ^:private no-context-error
-  (Exception. (str "Redis commands must be called within the context of a"
-                   " connection to Redis server. See `wcar`.")))
+;;;; Dynamic context
 
-(defmacro ^:private bytestring
-  "Redis communicates with clients using a (binary-safe) byte string protocol.
-  This is the equivalent of the byte array representation of a Java String."
-  [s] `(.getBytes ~s "UTF-8"))
+(deftype EnqueuedRequest [^long cluster-keyslot parser args bs-args #_opts])
+(defrecord Context [conn req-queue_ #_parser #_req-opts])
+(def ^:dynamic *context* "Current dynamic Context"         nil)
+(def ^:dynamic *parser*  "ifn (with optional meta) or nil" nil)
+(def no-context-ex
+  (ex-info "Redis commands must be called within the context of a connection to Redis server (see `wcar`)" {}))
 
-;;; Request delimiters
-(def ^bytes bs-crlf (bytestring "\r\n"))
-(def ^:const ^Integer bs-* (int (first (bytestring "*"))))
-(def ^:const ^Integer bs-$ (int (first (bytestring "$"))))
+(defmacro with-context "Implementation detail"
+  [conn & body]
+  `(binding [*context* (Context. ~conn (atom []))
+             *parser*  nil]
+     ~@body))
 
-;; Carmine-only markers that'll be used _within_ bulk data to indicate that
-;; the data requires special reply handling
-(def ^bytes bs-bin (bytestring "\u0000<")) ; Binary data marker
-(def ^bytes bs-clj (bytestring "\u0000>")) ; Frozen data marker
+;;;; Bytes
 
-(defrecord WrappedRaw [ba])
-(defn raw "Forces byte[] argument to be sent to Redis as raw, unencoded bytes."
-  [x] (if (utils/bytes? x) (->WrappedRaw x)
-          (throw (Exception. "Raw arg must be byte[]"))))
+(do
+  (defn ^:private -byte-str [^String s] (.getBytes s "UTF-8"))
+  (def  ^:private ^:const bs-* (int (first (-byte-str "*"))))
+  (def  ^:private ^:const bs-$ (int (first (-byte-str "$"))))
+  (def  ^:private bs-crlf                             (-byte-str "\r\n"))
+  (def  ^:private bs-bin "Carmine binary data marker" (-byte-str "\u0000<"))
+  (def  ^:private bs-clj "Carmine Nippy  data marker" (-byte-str "\u0000>")))
 
-(defprotocol IRedisArg (coerce-bs [x] "x -> [<ba> <meta>]"))
-(extend-protocol IRedisArg
-  String  (coerce-bs [x] [(bytestring x) nil])
-  Keyword (coerce-bs [x] [(bytestring ^String (utils/fq-name x)) nil])
+(def ^:private byte-int "Cache common counts, etc."
+  (let [cached (enc/memoize_ (fn [n] (-byte-str (Long/toString n))))]
+    (fn [n]
+      (if (<= ^long n 32767)
+        (cached n)
+        (-byte-str (Long/toString n))))))
 
-  ;;; Simple number types (Redis understands these)
-  Long    (coerce-bs [x] [(bytestring (str x)) nil])
-  Double  (coerce-bs [x] [(bytestring (str x)) nil])
-  Float   (coerce-bs [x] [(bytestring (str x)) nil])
-  Integer (coerce-bs [x] [(bytestring (str x)) nil])
+(defn- ensure-reserved-first-byte [^bytes ba]
+  (if (and (> (alength ba) 0) (zero? (aget ba 0)))
+    (throw (ex-info "Args can't begin with null terminator (byte 0)" {:ba ba}))
+    ba))
 
-  ;;;
-  WrappedRaw (coerce-bs [x] [(:ba x) :raw])
-  nil        (coerce-bs [x] [(nippy-tools/freeze x) :mark-frozen])
-  Object     (coerce-bs [x] [(nippy-tools/freeze x) :mark-frozen]))
+;;;; Redis<->Clj type coercion
+;; TODO Support pluggable serialization?
 
-(extend utils/bytes-class IRedisArg {:coerce-bs (fn [x] [x :mark-bytes])})
+(deftype WrappedRaw [ba])
+(defn raw
+  "Forces byte[] argument to be sent to Redis as raw, unencoded bytes."
+  [x]
+  (cond
+    (enc/bytes?           x) (WrappedRaw. x)
+    (instance? WrappedRaw x) x
+    :else
+    (throw
+      (ex-info "Raw arg must be byte[]"
+        {:given x :type (type x)}))))
 
-;;; Macros to actually send data to stream buffer
-(defmacro ^:private send-crlf [out] `(.write ~out bs-crlf 0 2))
-(defmacro ^:private send-bin  [out] `(.write ~out bs-bin  0 2))
-(defmacro ^:private send-clj  [out] `(.write ~out bs-clj  0 2))
-(defmacro ^:private send-*    [out] `(.write ~out bs-*))
-(defmacro ^:private send-$    [out] `(.write ~out bs-$))
-(defmacro ^:private send-arg
-  "Send arbitrary argument along with information about its size:
-  $<size of arg> crlf
-  <arg data>     crlf
+(defprotocol     IByteStr (byte-str [x] "Coerces arbitrary Clojure val to Redis bytestring"))
+(extend-protocol IByteStr
+  String     (byte-str [x] (ensure-reserved-first-byte (-byte-str               x)))
+  Keyword    (byte-str [x] (ensure-reserved-first-byte (-byte-str (enc/as-qname x))))
+  Long       (byte-str [x] (byte-int x))
+  Integer    (byte-str [x] (byte-int x))
+  Short      (byte-str [x] (byte-int x))
+  Byte       (byte-str [x] (byte-int x))
+  Double     (byte-str [x] (-byte-str (Double/toString x)))
+  Float      (byte-str [x] (-byte-str  (Float/toString x)))
+  WrappedRaw (byte-str [x] (.-ba x))
+  nil        (byte-str [x] (enc/ba-concat bs-clj (nippy-tools/freeze x)))
+  Object     (byte-str [x] (enc/ba-concat bs-clj (nippy-tools/freeze x))))
 
-  Argument type will determine how it'll be stored with Redis:
-    * String args become byte strings.
-    * Simple numbers (integers, longs, floats, doubles) become byte strings.
-    * Binary (byte array) args go through un-munged.
-    * Everything else gets serialized."
-  [out arg]
-  `(let [out#          ~out
-         arg#          ~arg
-         [ba# meta#]   (coerce-bs arg#)
-         ba#           (bytes   ba#)
-         payload-size# (alength ba#)
-         data-size#    (case meta# (:mark-bytes :mark-frozen) (+ payload-size# 2)
-                             payload-size#)]
+(extend-type (Class/forName "[B")
+  IByteStr (byte-str [x] (enc/ba-concat bs-bin x)))
 
-     ;; Reserve null first-byte for marked reply identification
-     (when (and (nil? meta#) (> payload-size# 0) (zero? (aget ba# 0)))
-       (throw (Exception. (str "Args can't begin with null terminator: " arg#))))
+;;;; Basic requests
 
-     (send-$ out#) (.write out# (bytestring (str data-size#))) (send-crlf out#)
-     (case meta# :mark-bytes  (send-bin out#)
-                 :mark-frozen (send-clj out#)
-                 nil)
-     (.write out# ba# 0 payload-size#)
-     (send-crlf out#)))
+(defn- send-requests
+  "Sends `EnqeuedRequest`s to Redis server using its byte string protocol:
+    *<no. of args>     crlf
+    [$<size of arg N>  crlf
+      <arg data>       crlf ...]"
+  ;; {:pre [(vector? requests)]}
+  [^BufferedOutputStream out ereqs]
+  (enc/run!
+    (fn [^EnqueuedRequest ereq]
+      (when-let [bs-args (.-bs-args ereq)] ; nil => `return`
+        (.write out bs-*)
+        (.write out ^bytes (byte-int (count bs-args)))
+        (.write out bs-crlf 0 2)
+        (enc/run!
+          (fn [^bytes bs-arg]
+            (let [payload-size (alength bs-arg)]
+              (.write out bs-$)
+              (.write out ^bytes (byte-int payload-size))
+              (.write out bs-crlf 0 2)
+              (.write out bs-arg  0 payload-size) ; Payload
+              (.write out bs-crlf 0 2)))
+          bs-args)))
+    ereqs)
+  (.flush out))
 
-(def ^:dynamic *listener-req-mode?* "Implementation detail." nil)
-(defmacro with-listener-req-mode "Implementation detail." [& body]
-  `(binding [*listener-req-mode?* true] ~@body))
+(defn get-unparsed-reply
+  "Implementation detail.
+  BLOCKS to receive a single reply from Redis server and returns the result as
+  [<type> <reply>]. Redis will reply to commands with different kinds of replies,
+  identified by their first byte, Ref. http://redis.io/topics/protocol:
 
-(defn send-request*
-  "Sends a command to Redis server using its byte string protocol:
-      *<no. of args>     crlf
-      [$<size of arg N>  crlf
-        <arg data>       crlf ...]"
-  [args]
-  (let [^BufferedOutputStream out (or (:out-stream *context*)
-                                      (throw no-context-error))]
+    * `+` for simple strings -> <string>
+    * `:` for integers       -> <long>
+    * `-` for error strings  -> <ex-info>
+    * `$` for bulk strings   -> <clj>/<raw-bytes>    ; Marked as serialized
+                             -> <bytes>/<raw-bytes>  ; Marked as binary
+                             -> <string>/<raw-bytes> ; Unmarked
+                             -> nil
+    * `*` for arrays         -> <vector>
+                             -> nil"
+  [^DataInputStream in req-opts]
+  (let [reply-type (int (.readByte in))]
+    (enc/case-eval reply-type
+      (int \+)                 (.readLine in)
+      (int \:) (Long/parseLong (.readLine in))
+      (int \-)
+      (let [err-str    (.readLine in)
+            err-prefix (re-find #"^\S+" err-str) ; "ERR", "WRONGTYPE", etc.
+            err-prefix (when err-prefix (keyword (str/lower-case err-prefix)))]
+        (ex-info err-str (if-not err-prefix {} {:prefix err-prefix})))
 
-    (send-* out) (.write out (bytestring (str (count args)))) (send-crlf out)
-    (doseq [arg args] (send-arg out arg))
-    (.flush out)
+      (int \*)
+      (let [bulk-count (Integer/parseInt (.readLine in))]
+        (if (== bulk-count -1)
+          nil ; Nb was [] with < Carmine v3
+          (enc/repeatedly-into [] bulk-count
+            (fn [] (get-unparsed-reply in req-opts)))))
 
-    (when-not *listener-req-mode?*
-      (swap! (:parser-queue *context*) conj *parser*))))
+      (int \$) ; Bulk strings need checking for special in-data markers
+      (let [ba-size (Integer/parseInt (.readLine in))]
+        (if (== ba-size -1)
+          nil
+          ;; Note that ba-size may be zero, e.g. (seq (byte-str ""))
+          (let [ba
+                (let [ba (byte-array ba-size)]
+                  (.readFully in ba 0 ba-size)
+                  (.readFully in (byte-array 2) 0 2) ; Discard final crlf
+                  ba)]
 
-(def ^:dynamic send-request send-request*)
+            (try
+              (enc/cond!
+               (get req-opts :raw-bulk?) ba ; :raw
 
-(defn get-basic-reply
-  "BLOCKS to receive a single reply from Redis server. Applies basic parsing
-  and returns the result.
+               ;; Special data marker
+               (and (>= ba-size 2) ; May be = 2 with (byte-array 0)
+                    (zero? (aget ba 0)))
+               (let [b1    (aget ba 1)]
+                 (enc/cond!
+                  (== b1 62 #_(aget bs-clj 1)) ; :clj
+                  (nippy-tools/thaw
+                   (java.util.Arrays/copyOfRange ba 2 ba-size)
+                   (get :thaw-opts req-opts))
 
-  Redis will reply to commands with different kinds of replies, identified by
-  their first byte:
-      * `+` for single line reply.
-      * `-` for error message.
-      * `:` for integer reply.
-      * `$` for bulk reply.
-      * `*` for multi bulk reply."
-  [^DataInputStream in raw?]
-  (let [reply-type (char (.readByte in))]
-    (case reply-type
-      \+ (.readLine in)
-      \- (Exception.     (.readLine in))
-      \: (Long/parseLong (.readLine in))
+                  (== b1 60 #_(aget bs-bin 1)) ; :bin
+                  (let [payload (java.util.Arrays/copyOfRange ba 2 ba-size)]
+                    ;; Workaround #81 (v2.6.0 may have written
+                    ;; *serialized* bins:
+                    (if (and
+                         (>= (alength payload) 5) ; 4 byte NPY_ header + data
+                         (== (aget payload 0) 78) ; N
+                         (== (aget payload 1) 80) ; P
+                         (== (aget payload 2) 89) ; Y
+                         )
+                      (try
+                        (nippy-tools/thaw payload (get :thaw-opts req-opts))
+                        (catch Exception _ payload))
+                      payload))
 
-      ;; Bulk replies need checking for special in-data markers
-      \$ (let [data-size (Integer/parseInt (.readLine in))]
-           (when-not (neg? data-size) ; NULL bulk reply
-             (let [maybe-marked-type? (and (not raw?) (>= data-size 2))
-                   type (or (when maybe-marked-type?
-                              (.mark in 2)
-                              (let [h (byte-array 2)]
-                                (.readFully in h 0 2)
-                                (condp utils/ba= h
-                                  bs-clj :clj
-                                  bs-bin :bin
-                                  nil)))
-                            (if raw? :raw :str))
+                  ;; :else (String. ba 0 ba-size "UTF-8")
+                  ))
 
-                   marked-type? (case type (:clj :bin) true false)
-                   payload-size (int (if marked-type? (- data-size 2) data-size))
-                   payload      (byte-array payload-size)]
+               :else ; Common case
+               (String. ba 0 ba-size "UTF-8"))
 
-               (when (and maybe-marked-type? (not marked-type?)) (.reset in))
-               (.readFully in payload 0 payload-size)
-               (.readFully in (byte-array 2) 0 2) ; Discard final crlf
+              (catch Exception e
+                (let [message (.getMessage e)]
+                  (ex-info (str "Bad reply data: " message)
+                    {:message message} e)))))))
 
-               (try
-                 (case type
-                   :str (String. payload 0 payload-size "UTF-8")
-                   :clj (nippy-tools/thaw payload)
-                   (:bin :raw) payload)
-                 (catch Exception e
-                   (Exception. (str "Bad reply data: " (.getMessage e)) e))))))
+      (throw
+        (ex-info (str "Server returned unknown reply type: " reply-type)
+          {:reply-type reply-type})))))
 
-      \* (let [bulk-count (Integer/parseInt (.readLine in))]
-           (utils/repeatedly* bulk-count (get-basic-reply in raw?)))
-      (throw (Exception. (str "Server returned unknown reply type: "
-                              reply-type))))))
+(let [not-found (Object.)]
+  (defn get-parsed-reply "Implementation detail"
+    [^DataInputStream in ?parser]
+    (if (nil? ?parser) ; Common case
+      (get-unparsed-reply in nil)
+      (let [;; As an impln detail, parser metadata is used as req-opts:
+            ;; {:keys [raw-bulk? thaw-opts dummy-reply :parse-exceptions?]}.
+            ;; We could instead choose to split parsers and req metadata but
+            ;; bundling the two is efficient + quite convenient in practice.
+            ;; Note that we choose to _merge_ parser metadata during parser
+            ;; comp. ; TODO Refactor
+            req-opts (meta ?parser)
+            unparsed-reply
+            (let [dr (get req-opts :dummy-reply not-found)]
+              (if (identical? dr not-found)
+                (get-unparsed-reply in req-opts)
+                dr))]
+
+        (if (and (instance? Exception unparsed-reply)
+              ;; Nb :parse-exceptions? is rare & not normally used by lib
+              ;; consumers. Such parsers need to be written to _not_
+              ;; interfere with our ability to interpret Cluster error msgs.
+              (not (get req-opts :parse-exceptions?)))
+
+          unparsed-reply ; Return unparsed
+          (try
+            (?parser unparsed-reply)
+            (catch Exception e
+              (let [message (.getMessage e)]
+                (ex-info (str "Parser error: " message)
+                  {:message message} e)))))))))
 
 ;;;; Parsers
 
@@ -174,80 +231,156 @@
   See also `parser-comp`."
   [f & body] `(binding [*parser* ~f] ~@body))
 
-(defn parser-comp "Composes parsers when f or g are nnil, preserving metadata."
-  [f g] (let [m (merge (meta g) (meta f))]
-          (with-meta (utils/comp-maybe f g) m)))
+(defn- comp-maybe [f g] (cond (and f g) (comp f g) f f g g :else nil))
+(comment ((comp-maybe nil identity) :x))
 
-(defn return
-  "Takes value and returns it unchanged as part of next reply from Redis server.
+(defn parser-comp "Composes parsers when f or g are nnil, preserving metadata"
+  [f g] (let [m (merge (meta g) (meta f))] (with-meta (comp-maybe f g) m)))
+
+;;; Special parsers used to communicate metadata to request enqueuer:
+(defmacro parse-raw             [& body] `(parse (with-meta identity {:raw-bulk? true})       ~@body))
+(defmacro parse-nippy [thaw-opts & body] `(parse (with-meta identity {:thaw-opts ~thaw-opts}) ~@body))
+
+(def return
+  "Takes values and returns them as part of next reply from Redis server.
   Unlike `echo`, does not actually send any data to Redis."
-  [value]
-  (let [vfn (with-meta identity {:dummy-reply value})]
-    (swap! (:parser-queue *context*) conj (parser-comp *parser* vfn))))
+  (let [return1
+        (fn [req-queue_ value]
+          (let [ereq
+                (EnqueuedRequest. 1
+                  (parser-comp *parser* ; Nb keep context's parser
+                    (with-meta identity {:dummy-reply value}))
+                  nil nil)]
+            (swap! req-queue_ conj ereq)))]
+    (fn
+      ([value] (return1 (:req-queue_ *context*) value))
+      ([value & more]
+       (enc/run! (partial return1 (:req-queue_ *context*))
+         (cons value more))))))
 
-(defn- get-parsed-reply [^DataInputStream in parser]
-  (if-not parser
-    (get-basic-reply in false) ; Common case
-    (let [;; Implementation detail! We use metadata to control optional
-          ;; reply/parser opts. Metadata is *merged* on parser composition.
-          {:keys [dummy-reply raw? parse-exceptions? thaw-opts] :as m} (meta parser)
-          reply (cond (contains? m :dummy-reply) dummy-reply
-                      thaw-opts (nippy-tools/with-thaw-opts thaw-opts
-                                  (get-basic-reply in raw?))
-                      :else     (get-basic-reply in raw?))]
-      (if (and (instance? Exception reply) (not parse-exceptions?))
-        reply ; Pass through w/o parsing
-        (try (parser reply)
-             (catch Exception e
-               (Exception. (format "Parser error: %s" (.getMessage e)) e)))))))
+(def ^:const suppressed-reply-kw :carmine/suppressed-reply)
+(defn-       suppressed-reply? [parsed-reply]
+  (identical? parsed-reply suppressed-reply-kw))
 
-(defn get-parsed-replies
+(defn- return-parsed-reply "Implementation detail"
+  [preply] (if (instance? Exception preply) (throw preply) preply))
+
+(defn return-parsed-replies "Implementation detail"
+  [preplies as-pipeline?]
+  (let [nreplies (count preplies)]
+    (if (or (> nreplies 1) as-pipeline?)
+      preplies
+      (let [;; nb nil fallback for possible suppressed replies:
+            pr1 (nth preplies 0 nil)]
+        (return-parsed-reply pr1)))))
+
+(defn- pull-requests "Implementation detail" [req-queue_]
+  (loop []
+    (let [rq @req-queue_]
+      (if (compare-and-set! req-queue_ rq [])
+        rq
+        (recur)))))
+
+(defn execute-requests
   "Implementation detail.
-  BLOCKS to receive queued (pipelined) replies from Redis server. Applies all
-  parsing and returns the result. Note that Redis returns replies as a FIFO
-  queue per connection."
-  [as-pipeline?]
-  (let [^DataInputStream in (or (:in-stream *context*) (throw no-context-error))
-        pq          (:parser-queue *context*)
-        parsers     @pq
-        reply-count (count parsers)]
-    (when (pos? reply-count)
-      (reset! pq [])
-      (if (or (> reply-count 1) as-pipeline?)
-        (mapv #(get-parsed-reply in %) parsers)
-        (let [single-reply (get-parsed-reply in (nth parsers 0))]
-          (if (instance? Exception single-reply) (throw single-reply)
-              single-reply))))))
+  Sends given/dynamic requests to given/dynamic Redis server and optionally
+  blocks to receive the relevant queued (pipelined) parsed replies."
 
-;;;; General-purpose macros
+  ;; For use with standard dynamic bindings
+  ([get-replies? as-pipeline?]
+     (let [{:keys [conn req-queue_]} *context*
+           requests (pull-requests req-queue_)]
+       (execute-requests conn requests get-replies? as-pipeline?)))
+
+  ;; For use with Cluster, etc.
+  ([conn requests get-replies? as-pipeline?]
+     (let [nreqs (count requests)]
+       (when (pos? nreqs)
+         (let [{:keys [in out]} conn]
+           (when-not (and in out) (throw no-context-ex))
+           ;; (println "Sending requests: " requests)
+           (send-requests out requests)
+           (when get-replies?
+             (if (or (> nreqs 1) as-pipeline?)
+               (let [parsed-replies
+                     (persistent!
+                       (reduce
+                         (fn [acc ^EnqueuedRequest ereq]
+                           (let [parsed-reply (get-parsed-reply in
+                                                (.-parser ereq))]
+                             (if (suppressed-reply? parsed-reply)
+                               acc
+                               (conj! acc parsed-reply))))
+                         (transient [])
+                         requests))
+                     nparsed-replies (count parsed-replies)]
+                 (return-parsed-replies parsed-replies as-pipeline?))
+
+               (let [^EnqueuedRequest ereq (nth requests 0)
+                     one-reply (get-parsed-reply in (.-parser ereq))]
+                 (return-parsed-reply one-reply)))))))))
+
+;;;;
+
+(def ^:dynamic *nested-stashed-reqs*     nil)
+(def ^:dynamic *nested-stash-consumed?_* nil)
+
+(defn -with-replies "Implementation detail"
+  [body-fn as-pipeline?]
+  (let [{:keys [conn req-queue_]} *context*
+        ?nested-stashed-reqs      *nested-stashed-reqs*
+        newly-stashed-reqs        (pull-requests req-queue_)
+
+        stashed-reqs ; We'll pass the stash down until the first stash consumer
+        (if-let [nsr ?nested-stashed-reqs]
+          (into nsr newly-stashed-reqs)
+          newly-stashed-reqs)]
+
+    (if (empty? stashed-reqs) ; Common case
+      (let [_        (body-fn)
+            new-reqs (pull-requests req-queue_)]
+        (execute-requests conn new-reqs :get-replies as-pipeline?))
+
+      (let [nested-stash-consumed?_ (atom false)
+            stash-size (count stashed-reqs)
+
+            ?throwable ; Binding to support nested `with-replies` in body-fn:
+            (binding [*nested-stashed-reqs*     stashed-reqs
+                      *nested-stash-consumed?_* nested-stash-consumed?_]
+              (try (body-fn) nil (catch Throwable t t)))
+
+            new-reqs    (pull-requests req-queue_)
+            all-reqs    (if @nested-stash-consumed?_ new-reqs (into stashed-reqs new-reqs))
+            all-replies (execute-requests conn all-reqs :get-replies :as-pipeline)
+            _           (when-let [nsc?_ *nested-stash-consumed?_*]
+                          (reset! nsc?_ true))
+
+            stashed-replies   (subvec all-replies 0 stash-size)
+            requested-replies (subvec all-replies   stash-size)]
+
+        ;; Restore any stashed replies to underlying stateful context:
+        (parse nil ; We already parsed on stashing
+          (enc/run! return stashed-replies))
+
+        (if ?throwable
+          (throw ?throwable)
+          (return-parsed-replies requested-replies as-pipeline?))))))
 
 (defmacro with-replies
   "Alpha - subject to change.
-  Evaluates body, immediately returning the server's response to any contained
-  Redis commands (i.e. before enclosing context ends).
+  Evaluates body, immediately returning the server's response to any
+  contained Redis commands (i.e. before enclosing context ends).
 
   As an implementation detail, stashes and then `return`s any replies already
   queued with Redis server: i.e. should be compatible with pipelining.
 
-  Note on parsers: if you're writing a Redis command (e.g. a fn that is intended
-  to execute w/in an implicit connection context) and you're using `with-replies`
-  as an implementation detail (i.e. you're interpreting replies internally), you
-  probably want `(parse nil (with-replies ...))` to keep external parsers from
-  leaking into your internal logic."
-  {:arglists '([:as-pipeline & body] [& body])} ; TODO Consider [opts-map & body]
-  [& [s1 & sn :as sigs]]
-  (let [as-pipeline? (identical? s1 :as-pipeline)
-        body         (if as-pipeline? sn sigs)]
-    `(let [stashed-replies# (get-parsed-replies :as-pipeline)]
-       (try (do ~@body) ; (parse nil ~@body) would be hygienically conservative
-            (get-parsed-replies ~as-pipeline?)
-            (finally (parse nil (mapv return stashed-replies#)))))))
-
-(defmacro with-context
-  "Evaluates body in the context of a thread-bound connection to a Redis server."
-  [conn & body]
-  `(let [conn# ~conn
-         {spec# :spec in-stream# :in-stream out-stream# :out-stream} conn#]
-     (binding [*context* (->Context conn# in-stream# out-stream# (atom []))
-               *parser*  nil]
-       ~@body)))
+  Note on parsers: if you're writing a Redis command (e.g. a fn that is
+  intended to execute w/in an implicit connection context) and you're using
+  `with-replies` as an implementation detail (i.e. you're interpreting
+  replies internally), you probably want `(parse nil (with-replies ...))` to
+  keep external parsers from leaking into your internal logic."
+  {:arglists '([:as-pipeline & body] [& body])}
+  [& [a1 & an :as args]]
+  (let [as-pipeline? (identical? a1 :as-pipeline)
+        body         (if as-pipeline? an args)]
+    `(-with-replies (fn [] ~@body) ~as-pipeline?)))

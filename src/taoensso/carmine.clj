@@ -1,25 +1,29 @@
 (ns taoensso.carmine "Clojure Redis client & message queue."
-  {:author "Peter Taoussanis"}
+  {:author "Peter Taoussanis (@ptaoussanis)"}
   (:refer-clojure :exclude [time get set key keys type sync sort eval])
-  (:require [clojure.string :as str]
+  (:require [clojure.string       :as str]
+            [taoensso.encore      :as enc]
+            [taoensso.timbre      :as timbre]
+            [taoensso.nippy.tools :as nippy-tools]
             [taoensso.carmine
-             (utils       :as utils)
              (protocol    :as protocol)
              (connections :as conns)
-             (commands    :as commands)]
-            [taoensso.timbre      :as timbre]
-            [taoensso.nippy.tools :as nippy-tools]))
+             (commands    :as commands)]))
+
+(if (vector? taoensso.encore/encore-version)
+  (enc/assert-min-encore-version [2 67 2])
+  (enc/assert-min-encore-version  2.67))
 
 ;;;; Connections
 
-(utils/defalias with-replies protocol/with-replies)
+(enc/defalias with-replies protocol/with-replies)
 
 (defmacro wcar
-  "Evaluates body in the context of a thread-bound pooled connection to Redis
-  server. Sends Redis commands to server as pipeline and returns the server's
-  response. Releases connection back to pool when done.
+  "Evaluates body in the context of a fresh thread-bound pooled connection to
+  Redis server. Sends Redis commands to server as pipeline and returns the
+  server's response. Releases connection back to pool when done.
 
-  `conn` arg is a map with connection pool and spec options:
+  `conn-opts` arg is a map with connection pool and spec options:
     {:pool {} :spec {:host \"127.0.0.1\" :port 6379}} ; Default
     {:pool {} :spec {:uri \"redis://redistogo:pass@panga.redistogo.com:9475/\"}}
     {:pool {} :spec {:host \"127.0.0.1\" :port 6379
@@ -27,18 +31,41 @@
                      :timeout-ms 6000
                      :db 3}}
 
-  A `nil` or `{}` `conn` or opts will use defaults. A `:none` pool can be used
-  to skip connection pooling. For other pool options, Ref. http://goo.gl/EiTbn."
-  {:arglists '([conn :as-pipeline & body] [conn & body])}
-  [conn & sigs]
-  `(let [{pool-opts# :pool spec-opts# :spec} ~conn
-         [pool# conn#] (conns/pooled-conn pool-opts# spec-opts#)]
+  A `nil` or `{}` `conn-opts` will use defaults. A `:none` pool can be used
+  to skip connection pooling (not recommended).
+  For other pool options, Ref. http://goo.gl/e1p1h3,
+                               http://goo.gl/Sz4uN1 (defaults).
+
+  Note that because of thread-binding, you'll probably want to avoid lazy Redis
+  command calls in `wcar`'s body unless you know what you're doing. Compare:
+  `(wcar {} (for   [k [:k1 :k2]] (car/set k :val))` ; Lazy, NO commands run
+  `(wcar {} (doseq [k [:k1 :k2]] (car/set k :val))` ; Not lazy, commands run
+
+  See also `with-replies`."
+  {:arglists '([conn-opts :as-pipeline & body] [conn-opts & body])}
+  [conn-opts & args] ; [conn-opts & [a1 & an :as args]]
+  `(let [[pool# conn#] (conns/pooled-conn ~conn-opts)
+
+         ;; To support `wcar` nesting with req planning, we mimic
+         ;; `with-replies` stashing logic here to simulate immediate writes:
+         ?stashed-replies#
+         (when protocol/*context*
+           (protocol/execute-requests :get-replies :as-pipeline))]
+
      (try
        (let [response# (protocol/with-context conn#
-                         (with-replies ~@sigs))]
+                         (protocol/with-replies ~@args))]
          (conns/release-conn pool# conn#)
          response#)
-       (catch Exception e# (conns/release-conn pool# conn# e#) (throw e#)))))
+
+       (catch Throwable t# ; nb Throwable to catch assertions, etc.
+         (conns/release-conn pool# conn# t#) (throw t#))
+
+       ;; Restore any stashed replies to preexisting context:
+       (finally
+         (when ?stashed-replies#
+           (parse nil ; Already parsed on stashing
+             (enc/run! return ?stashed-replies#)))))))
 
 (comment
   (wcar {} (ping) "not-a-Redis-command" (ping))
@@ -47,51 +74,34 @@
   (wcar {} :as-pipeline (ping))
 
   (wcar {} (echo 1) (println (with-replies (ping))) (echo 2))
-  (wcar {} (echo 1) (println (with-replies :as-pipeline (ping))) (echo 2)))
+  (wcar {} (echo 1) (println (with-replies :as-pipeline (ping))) (echo 2))
+  (def setupf (fn [_] (println "boo")))
+  (wcar {:spec {:conn-setup-fn setupf}}))
 
-;;;; Misc
+;;;; Misc core
 
-;;; (number? x) for Carmine < v0.11.x backwards compatiblility
-(defn as-long   [x] (when x (if (number? x) (long   x) (Long/parseLong     x))))
-(defn as-double [x] (when x (if (number? x) (double x) (Double/parseDouble x))))
-(defn as-bool   [x] (when x
-                      (cond (or (true? x) (false? x))            x
-                            (or (= x "false") (= x "0") (= x 0)) false
-                            (or (= x "true")  (= x "1") (= x 1)) true
-                            :else
-                            (throw (Exception. (str "Couldn't coerce as bool: "
-                                                    x))))))
+;;; Mostly deprecated; prefer using encore stuff directly
+(defn as-int   [x] (when x (enc/as-int   x)))
+(defn as-float [x] (when x (enc/as-float x)))
+(defn as-bool  [x] (when x (enc/as-bool  x)))
 
-(utils/defalias parse       protocol/parse)
-(utils/defalias parser-comp protocol/parser-comp)
+(enc/defalias parse       protocol/parse)
+(enc/defalias parser-comp protocol/parser-comp)
+(enc/defalias parse-raw   protocol/parse-raw)
+(enc/defalias parse-nippy protocol/parse-nippy)
 
-(defmacro parse-long    [& body] `(parse as-long   ~@body))
-(defmacro parse-double  [& body] `(parse as-double ~@body))
-(defmacro parse-bool    [& body] `(parse as-bool   ~@body))
-(defmacro parse-keyword [& body] `(parse keyword   ~@body))
-(defmacro parse-raw     [& body] `(parse (with-meta identity {:raw? true}) ~@body))
-(defmacro parse-nippy [thaw-opts & body]
-  `(parse (with-meta identity {:thaw-opts ~thaw-opts}) ~@body))
+(defmacro parse-int      [& body] `(parse as-int   ~@body))
+(defmacro parse-float    [& body] `(parse as-float ~@body))
+(defmacro parse-bool     [& body] `(parse as-bool  ~@body))
+(defmacro parse-keyword  [& body] `(parse keyword  ~@body))
+(defmacro parse-suppress [& body]
+  `(parse (fn [_#] protocol/suppressed-reply-kw) ~@body))
 
-(defn as-map [coll & [kf vf]]
-  {:pre  [(coll? coll) (or (nil? kf) (fn? kf) (identical? kf :keywordize))
-                       (or (nil? vf) (fn? vf))]
-   :post [(or (nil? %) (map? %))]}
-  (when-let [s' (seq coll)]
-    (let [kf (if-not (identical? kf :keywordize) kf
-                     (fn [k _] (keyword k)))]
-      (loop [m (transient {}) [k v :as s] s']
-        (let [k (if-not kf k (kf k v))
-              v (if-not vf v (vf k v))
-              new-m (assoc! m k v)]
-          (if-let [n (nnext s)]
-            (recur new-m n)
-            (persistent! new-m)))))))
+(comment (wcar {} (parse-suppress (ping)) (ping) (ping)))
 
-(comment (as-map ["a" "A" "b" "B" "c" "C"] :keywordize
-           (fn [k v] (case k (:a :b) (str "boo-" v) v))))
-
-(defmacro parse-map [form & [kf vf]] `(parse #(as-map % ~kf ~vf) ~form))
+(enc/compile-if enc/str-join
+  (defn key* [parts] (enc/str-join ":" (map #(if (keyword? %) (enc/as-qname %) (str %))) parts))
+  (defn key* [parts] (str/join     ":" (map #(if (keyword? %) (enc/as-qname %) (str %))  parts))))
 
 (defn key
   "Joins parts to form an idiomatic compound Redis key name. Suggested style:
@@ -99,26 +109,23 @@
     * Singular category names (\"account\" rather than \"accounts\").
     * Plural _field_ names when appropriate (\"account:friends\").
     * Dashes for long names (\"email-address\" rather than \"emailAddress\", etc.)."
-  [& parts] (str/join ":" (mapv #(if (keyword? %) (utils/fq-name %) (str %))
-                                parts)))
+  [& parts] (key* parts))
 
 (comment (key :foo/bar :baz "qux" nil 10))
 
-(utils/defalias raw            protocol/raw)
-(utils/defalias with-thaw-opts nippy-tools/with-thaw-opts)
-(utils/defalias freeze         nippy-tools/wrap-for-freezing
+(enc/defalias raw            protocol/raw)
+(enc/defalias with-thaw-opts nippy-tools/with-thaw-opts)
+(enc/defalias freeze         nippy-tools/wrap-for-freezing
   "Forces argument of any type (incl. keywords, simple numbers, and binary types)
   to be subject to automatic de/serialization with Nippy.")
 
-(utils/defalias return protocol/return)
+(enc/defalias return protocol/return)
 (comment (wcar {} (return :foo) (ping) (return :bar))
          (wcar {} (parse name (return :foo)) (ping) (return :bar)))
 
 ;;;; Standard commands
 
-(commands/defcommands) ; This kicks ass - big thanks to Andreas Bielk!
-
-;;;; Helper commands
+(commands/defcommands) ; Defines 190+ Redis command fns as per official spec
 
 (defn redis-call
   "Sends low-level requests to Redis. Useful for DSLs, certain kinds of command
@@ -127,17 +134,22 @@
 
   (redis-call [:set \"foo\" \"bar\"] [:get \"foo\"])"
   [& requests]
-  (doseq [[cmd & args] requests]
-    (let [cmd-parts (-> cmd name str/upper-case (str/split #"-"))]
-      (protocol/send-request (into (vec cmd-parts) args)))))
+  (enc/run!
+    (fn [[cmd & args]]
+      (let [cmd-parts (-> cmd name str/upper-case (str/split #"-"))
+            request   (into (vec cmd-parts) args)]
+        (commands/enqueue-request (count cmd-parts) request)))
+    requests))
 
 (comment (wcar {} (redis-call [:set "foo" "bar"] [:get "foo"]
                               [:config-get "*max-*-entries*"])))
 
-;;; Lua scripts
+;;;; Lua/scripting support
 
-(def script-hash (memoize (fn [script]
-  (org.apache.commons.codec.digest.DigestUtils/shaHex (str script)))))
+(defn- sha1-str [x]         (org.apache.commons.codec.digest.DigestUtils/sha1Hex (str x)))
+(defn- sha1-ba  [^bytes ba] (org.apache.commons.codec.digest.DigestUtils/sha1Hex ba))
+
+(def script-hash (memoize (fn [script] (sha1-str script))))
 
 (defn evalsha* "Like `evalsha` but automatically computes SHA1 hash for script."
   [script numkeys key & args] (apply evalsha (script-hash script) numkeys key args))
@@ -147,18 +159,15 @@
   of a \"NOSCRIPT\" reply, reattempts with `eval`. Returns the final command's
   reply. Redis Cluster note: keys need to all be on same shard."
   [script numkeys key & args]
-  (let [[r & _] (->> (apply evalsha* script numkeys key args)
-                     (with-replies :as-pipeline)
-                     ;; (parse nil) ; Nb
-                     ;; This is an unusual case - we want to ignore general
-                     ;; enclosing parsers, but _keep_ raw parsing metadata when
-                     ;; present (this doesn't affect exception handling):
-                     (parse
-                      (if (:raw? (meta protocol/*parser*))
-                        (with-meta identity {:raw? true}) ; parse-raw
-                        nil)))]
-    (if (and (instance? Exception r)
-             (.startsWith (.getMessage ^Exception r) "NOSCRIPT"))
+  (let [parser ; Respect :raw-bulk, otherwise ignore parser:
+        (if-not (:raw-bulk? (meta protocol/*parser*))
+          nil ; As `parse-raw`:
+          (with-meta identity {:raw-bulk? true}))
+        [r & _] ; & _ for :as-pipeline
+        (parse parser (with-replies :as-pipeline
+                        (apply evalsha* script numkeys key args)))]
+    (if (= (:prefix (ex-data r)) :noscript)
+      ;;; Now apply context's parser:
       (apply eval script numkeys key args)
       (return r))))
 
@@ -178,8 +187,9 @@
                     ;; Stop ":foo" replacing ":foo-bar" w/o need for insane Regex:
                     (sort-by #(- (.length ^String (first %))))))))))
 
-(comment (script-subst-vars "_:k1 _:a1 _:k2! _:a _:k3? _:k _:a2 _:a _:a3 _:a-4"
-           [:k3? :k1 :k2! :k] [:a2 :a-4 :a3 :a :a1]))
+(comment
+  (script-subst-vars "_:k1 _:a1 _:k2! _:a _:k3? _:k _:a2 _:a _:a3 _:a-4"
+    [:k3? :k1 :k2! :k] [:a2 :a-4 :a3 :a :a1]))
 
 (defn- script-prep-vars "-> [<key-vars> <arg-vars> <var-vals>]"
   [keys args]
@@ -188,8 +198,9 @@
    (into (vec (if (map? keys) (vals keys) keys))
               (if (map? args) (vals args) args))])
 
-(comment (script-prep-vars {:k1 :K1 :k2 :K2} {:a1 :A1 :a2 :A2})
-         (script-prep-vars [:K1 :K2] {:a1 :A1 :a2 :A2}))
+(comment
+  (script-prep-vars {:k1 :K1 :k2 :K2} {:a1 :A1 :a2 :A2})
+  (script-prep-vars [:K1 :K2] {:a1 :A1 :a2 :A2}))
 
 (defn lua
   "All singing, all dancing Lua script helper. Like `eval*` but allows script
@@ -202,14 +213,15 @@
   [script keys args]
   (let [[key-vars arg-vars var-vals] (script-prep-vars keys args)]
     (apply eval* (script-subst-vars script key-vars arg-vars)
-           (count keys) ; Not key-vars!
-           var-vals)))
+      (count keys) ; Not key-vars!
+      var-vals)))
 
-(comment (wcar {}
-           (lua "redis.call('set', _:my-key, _:my-val)
-                 return redis.call('get', 'foo')"
-                {:my-key "foo"}
-                {:my-val "bar"})))
+(comment
+  (wcar {}
+    (lua "redis.call('set', _:my-key, _:my-val)
+          return redis.call('get', 'foo')"
+      {:my-key "foo"}
+      {:my-val "bar"})))
 
 (def ^:private scripts-loaded-locally "#{[<conn-spec> <sha>]...}" (atom #{}))
 (defn lua-local
@@ -229,26 +241,26 @@
           (swap! scripts-loaded-locally conj [conn-spec sha])
           (evalsha)))))
 
-(comment (wcar {} (lua       "return redis.call('ping')" {:_ "_"} {}))
-         (wcar {} (lua-local "return redis.call('ping')" {:_ "_"} {}))
+(comment
+  (wcar {} (lua       "return redis.call('ping')" {:_ "_"} {}))
+  (wcar {} (lua-local "return redis.call('ping')" {:_ "_"} {}))
 
-         (clojure.core/time
-          (dotimes [_ 10000]
-            (wcar {} (ping) (lua "return redis.call('ping')" {:_ "_"} {})
-                     (ping) (ping) (ping))))
+  (enc/qb 1000
+    (wcar {} (ping) (lua "return redis.call('ping')" {:_ "_"} {})
+      (ping) (ping) (ping))) ; ~140
 
-         (clojure.core/time
-          (dotimes [_ 10000]
-            (wcar {} (ping) (lua-local "return redis.call('ping')" {:_ "_"} {})
-                     (ping) (ping) (ping)))))
+  (enc/qb 1000
+    (wcar {} (ping) (lua-local "return redis.call('ping')" {:_ "_"} {})
+      (ping) (ping) (ping))) ; ~135 (localhost)
+  )
 
-;;;
+;;;; Misc helpers
+;; These are pretty rusty + kept around mostly for back-compatibility
 
 (defn hmset* "Like `hmset` but takes a map argument."
   [key m] (apply hmset key (reduce concat m)))
 
-(defn info*
-  "Like `info` but automatically coerces reply into a hash-map."
+(defn info* "Like `info` but automatically coerces reply into a hash-map."
   [& [clojureize?]]
   (->> (info)
        (parse
@@ -264,17 +276,13 @@
 
 (comment (wcar {} (info* :clojurize)))
 
-(defn zinterstore*
-  "Like `zinterstore` but automatically counts keys."
-  [dest-key source-keys & options]
-  (apply zinterstore dest-key
-         (count source-keys) (concat source-keys options)))
+(defn zinterstore* "Like `zinterstore` but automatically counts keys."
+  [dest-key source-keys & opts]
+  (apply zinterstore dest-key (count source-keys) (concat source-keys opts)))
 
-(defn zunionstore*
-  "Like `zunionstore` but automatically counts keys."
-  [dest-key source-keys & options]
-  (apply zunionstore dest-key
-         (count source-keys) (concat source-keys options)))
+(defn zunionstore* "Like `zunionstore` but automatically counts keys."
+  [dest-key source-keys & opts]
+  (apply zunionstore dest-key (count source-keys) (concat source-keys opts)))
 
 ;; Adapted from redis-clojure
 (defn- parse-sort-args [args]
@@ -283,21 +291,16 @@
       out
       (let [[type & args] remaining-args]
         (case type
-          :by (let [[pattern & rest] args]
-                (recur (conj out "BY" pattern) rest))
-          :limit (let [[offset count & rest] args]
-                   (recur (conj out "LIMIT" offset count) rest))
-          :get (let [[pattern & rest] args]
-                 (recur (conj out "GET" pattern) rest))
-          :mget (let [[patterns & rest] args]
-                  (recur (into out (interleave (repeat "GET")
-                                               patterns)) rest))
-          :store (let [[dest & rest] args]
-                   (recur (conj out "STORE" dest) rest))
+          :by    (let [[pattern & rest] args]      (recur (conj out "BY" pattern) rest))
+          :limit (let [[offset count & rest] args] (recur (conj out "LIMIT" offset count) rest))
+          :get   (let [[pattern & rest] args]      (recur (conj out "GET" pattern) rest))
+          :mget  (let [[patterns & rest] args]     (recur (into out (interleave (repeat "GET")
+                                                                      patterns)) rest))
+          :store (let [[dest & rest] args]         (recur (conj out "STORE" dest) rest))
           :alpha (recur (conj out "ALPHA") args)
           :asc   (recur (conj out "ASC")   args)
           :desc  (recur (conj out "DESC")  args)
-          (throw (Exception. (str "Unknown sort argument: " type))))))))
+          (throw (ex-info (str "Unknown sort argument: " type) {:type type})))))))
 
 (defn sort*
   "Like `sort` but supports idiomatic Clojure arguments: :by pattern,
@@ -305,8 +308,141 @@
   :alpha, :asc, :desc."
   [key & sort-args] (apply sort key (parse-sort-args sort-args)))
 
+;;;; Persistent stuff (monitoring, pub/sub, etc.)
+;; Once a connection to Redis issues a command like `p/subscribe` or `monitor`
+;; it enters an idiosyncratic state:
+;;
+;;     * It blocks while waiting to receive a stream of special messages issued
+;;       to it (connection-local!) by the server.
+;;     * It can now only issue a subset of the normal commands like
+;;       `p/un/subscribe`, `quit`, etc. These do NOT issue a normal server reply.
+;;
+;; To facilitate the unusual requirements we define a Listener to be a
+;; combination of persistent, NON-pooled connection and threaded message
+;; handler.
+
+(declare close-listener)
+
+(defrecord Listener [connection handler state future]
+  java.io.Closeable
+  (close [this] (close-listener this)))
+
+(defmacro with-new-listener
+  "Creates a persistent[1] connection to Redis server and a thread to listen for
+  server messages on that connection.
+
+  Incoming messages will be dispatched (along with current listener state) to
+  (fn handler [reply state-atom]).
+
+  Evaluates body within the context of the connection and returns a
+  general-purpose Listener containing:
+    1. The underlying persistent connection to facilitate `close-listener` and
+       `with-open-listener`.
+    2. An atom containing the function given to handle incoming server messages.
+    3. An atom containing any other optional listener state.
+
+  Useful for Pub/Sub, monitoring, etc.
+
+  [1] You probably do *NOT* want a :timeout for your `conn-spec` here."
+  [conn-spec handler initial-state & body]
+  `(let [handler-atom# (atom ~handler)
+         state-atom#   (atom ~initial-state)
+         {:as conn# in# :in} (conns/make-new-connection
+                              (assoc (conns/conn-spec ~conn-spec)
+                                     :listener? true))
+         future# (future-call ; Thread to long-poll for messages
+                  (bound-fn []
+                    (while true ; Closes when conn closes
+                      (let [reply# (protocol/get-unparsed-reply in# {})]
+                        (try
+                          (@handler-atom# reply# @state-atom#)
+                          (catch Throwable t#
+                            (timbre/error t# "Listener handler exception")))))))]
+
+     (protocol/with-context conn# ~@body
+       (protocol/execute-requests (not :get-replies) nil))
+     (Listener. conn# handler-atom# state-atom# future#)))
+
+(defmacro with-open-listener
+  "Evaluates body within the context of given listener's preexisting persistent
+  connection."
+  [listener & body]
+  `(protocol/with-context (:connection ~listener) ~@body
+     (protocol/execute-requests (not :get-replies) nil)))
+
+(defn close-listener [listener]
+  (conns/close-conn (:connection listener))
+  (future-cancel (:future listener)))
+
+(defmacro with-new-pubsub-listener
+  "A wrapper for `with-new-listener`.
+
+  Creates a persistent[1] connection to Redis server and a thread to
+  handle messages published to channels that you subscribe to with
+  `subscribe`/`psubscribe` calls in body.
+
+  Handlers will receive messages of form:
+    [<msg-type> <channel/pattern> <message-content>].
+
+  (with-new-pubsub-listener
+    {} ; Connection spec, as per `wcar` docstring [1]
+    {\"channel1\" (fn [[type match content :as msg]] (prn \"Channel match: \" msg))
+     \"user*\"    (fn [[type match content :as msg]] (prn \"Pattern match: \" msg))}
+    (subscribe \"foobar\") ; Subscribe thread conn to \"foobar\" channel
+    (psubscribe \"foo*\")  ; Subscribe thread conn to \"foo*\" channel pattern
+   )
+
+  Returns the Listener to allow manual closing and adjustments to
+  message-handlers.
+
+  [1] You probably do *NOT* want a :timeout for your `conn-spec` here."
+  [conn-spec message-handlers & subscription-commands]
+  `(with-new-listener (assoc ~conn-spec :pubsub-listener? true)
+
+     ;; Message handler (fn [message state])
+     (fn [[_# source-channel# :as incoming-message#] msg-handlers#]
+       (when-let [f# (clojure.core/get msg-handlers# source-channel#)]
+         (f# incoming-message#)))
+
+     ~message-handlers ; Initial state
+     ~@subscription-commands))
+
+;;;; Atomic macro
+;; The design here's a little on the heavy side; I'd suggest instead reaching
+;; for the (newer) CAS tools or (if you need more flexibility), using a Lua
+;; script or adhoc `multi`+`watch`+`exec` loop.
+
+(defmacro atomic* "Alpha - subject to change. Low-level transaction util."
+  [conn-opts max-cas-attempts on-success on-failure]
+  `(let [conn-opts#  ~conn-opts
+         max-idx#    ~max-cas-attempts
+         _# (assert (>= max-idx# 1))
+         prelude-result# (atom nil)
+         exec-result#
+         (wcar conn-opts# ; Hold 1 conn for all attempts
+           (loop [idx# 1]
+             (try (reset! prelude-result#
+                    (protocol/with-replies :as-pipeline (do ~on-success)))
+                  (catch Throwable t1# ; nb Throwable to catch assertions, etc.
+                    ;; Always return conn to normal state:
+                    (try (protocol/with-replies (discard))
+                         (catch Throwable t2# nil) ; Don't mask t1#
+                         )
+                    (throw t1#)))
+             (let [r# (protocol/with-replies (exec))]
+               (if-not (nil? r#) ; => empty `multi` or watched key changed
+                 ;; Was [] with < Carmine v3
+                 (return r#)
+                 (if (= idx# max-idx#)
+                   (do ~on-failure)
+                   (recur (inc idx#)))))))]
+
+     [@prelude-result#
+      (protocol/return-parsed-replies
+        exec-result# (not :as-pipeline))]))
+
 (defmacro atomic
-  "Alpha - subject to change!!
+  "Alpha - subject to change!
   Tool to ease Redis transactions for fun & profit. Wraps body in a `wcar`
   call that terminates with `exec`, cleans up reply, and supports automatic
   retry for failed optimistic locking.
@@ -323,10 +459,11 @@
   (atomic {} 100 ; Retry <= 100 times on failed optimistic lock, or throw ex
 
     (watch  :my-int-key) ; Watch key for changes
-    (let [curr-val (-> (wcar {} ; Note additional connection!
-                         (get :my-int-key)) ; Use val of watched key
-                       (as-long)
-                       (or 0))]
+    (let [;; You can grab the value of the watched key using
+          ;; `with-replies` (on the current connection), or
+          ;; a nested `wcar` (on a new connection):
+          curr-val (or (as-long (with-replies (get :my-int-key))) 0)]
+
       (return curr-val)
 
       (multi) ; Start the transaction
@@ -337,36 +474,12 @@
       [\"OK\" \"1\"] ; Transaction replies (`exec` reply)
       ]
 
-  See also `lua` as an alternative method of achieving transactional behaviour."
-  [conn max-cas-attempts & body]
-  (assert (>= max-cas-attempts 1))
-  `(let [conn#       ~conn
-         max-idx#    ~max-cas-attempts
-         prelude-result# (atom nil)
-         exec-result#
-         (wcar conn# ; Hold 1 conn for all attempts
-           (loop [idx# 1]
-             (try (do ~@body)
-                  (catch Exception e#
-                    (discard) ; Always return conn to normal state
-                    (throw e#)))
-             (reset! prelude-result# (protocol/get-parsed-replies :as-pipeline))
-             (let [r# (->> (with-replies (exec))
-                           (parse nil) ; Nb
-                           )]
-               (if (not= r# []) ; => empty `mutli` or watched key changed
-                 (return r#)
-                 (if (= idx# max-idx#)
-                   (throw (Exception. (format "`atomic` failed after %s attempt(s)"
-                                              idx#)))
-                   (recur (inc idx#)))))))]
-
-     [@prelude-result#
-      ;; Mimic normal `get-parsed-replies` behaviour here re: vectorized replies:
-      (let [r# exec-result#]
-        (if (next r#) r#
-          (let [r# (nth r# 0)]
-            (if (instance? Exception r#) (throw r#) r#))))]))
+  See also `lua` as alternative way to get transactional behaviour."
+  [conn-opts max-cas-attempts & body]
+  `(atomic* ~conn-opts ~max-cas-attempts (do ~@body)
+     (throw (ex-info (format "`atomic` failed after %s attempt(s)"
+                       ~max-cas-attempts)
+              {:nattempts ~max-cas-attempts}))))
 
 (comment
   ;; Error before exec (=> syntax, etc.)
@@ -384,192 +497,247 @@
   ;; ["OK" "QUEUED" "OK" #<Exception: ERR EXEC without MULTI>]
 
   (wcar {} (watch "aa") (set "aa" "string") (multi) (ping) (exec))
-  ;; ["OK" "OK" "OK" "QUEUED" []]
+  ;; ["OK" "OK" "OK" "QUEUED" []]  ; Old reply fn
+  ;; ["OK" "OK" "OK" "QUEUED" nil] ; New reply fn
 
   (wcar {} (watch "aa") (set "aa" "string") (unwatch) (multi) (ping) (exec))
   ;; ["OK" "OK" "OK" "OK" "QUEUED" ["PONG"]]
 
   (wcar {} (multi) (multi))
   ;; ["OK" #<Exception java.lang.Exception: ERR MULTI calls can not be nested>]
+
+  (atomic {} 100 (/ 5 0)) ; Divide by zero
   )
 
-;;;; Persistent stuff (monitoring, pub/sub, etc.)
+(comment
+  (defn swap "`multi`-based `swap`"
+    [k f & [nmax-attempts abort-val]]
+    (loop [idx 1]
+      ;; (println idx)
+      (parse-suppress (watch k))
+      (let [[old-val ex] (parse nil (with-replies (get k) (exists k)))
+            nx?          (= ex 0)
+            [new-val return-val] (enc/-vswapped (f old-val nx?))
+            cas-success? (parse nil
+                           (with-replies
+                             (parse-suppress (multi) (set k new-val))
+                             (exec)))]
+        (if cas-success?
+          (return return-val)
+          (if (or (nil? nmax-attempts) (< idx (long nmax-attempts)))
+            (recur (inc idx))
+            (return abort-val)))))))
 
-;; Once a connection to Redis issues a command like `p/subscribe` or `monitor`
-;; it enters an idiosyncratic state:
-;;
-;;     * It blocks while waiting to receive a stream of special messages issued
-;;       to it (connection-local!) by the server.
-;;     * It can now only issue a subset of the normal commands like
-;;       `p/un/subscribe`, `quit`, etc. These do NOT issue a normal server reply.
-;;
-;; To facilitate the unusual requirements we define a Listener to be a
-;; combination of persistent, NON-pooled connection and threaded message
-;; handler.
+;;;; CAS tools (experimental!)
+;; Working around the lack of simple CAS in Redis core, Ref http://goo.gl/M4Phx8
 
-(declare close-listener)
+(defn- prep-cas-old-val [x]
+  (let [^bytes bs (protocol/byte-str x)
+        ;; Don't bother with sha when actual value would be shorter:
+        ?sha      (when (> (alength bs) 40) (sha1-ba bs))]
+    [?sha (raw bs)]))
 
-(defrecord Listener [connection handler state]
-  java.io.Closeable
-  (close [this] (close-listener this)))
+(comment (enc/qb 1000 (prep-cas-old-val "hello there")))
 
-(defmacro with-new-listener
-  "Creates a persistent connection to Redis server and a thread to listen for
-  server messages on that connection.
+(def compare-and-set "Experimental."
+  (let [script (enc/slurp-resource "lua/cas-set.lua")]
+    (fn self
+      ([k old-val ?sha new-val]
+       (lua script {:k k}
+         {:old-?sha (or ?sha "")
+          :old-?val (if ?sha "" old-val)
+          :new-val  new-val}))
 
-  Incoming messages will be dispatched (along with current listener state) to
-  binary handler function.
+      ([k old-val new-val]
+       (let [[?sha raw-bs] (prep-cas-old-val old-val)]
+         (self k raw-bs ?sha new-val))))))
 
-  Evaluates body within the context of the connection and returns a
-  general-purpose Listener containing:
+(def compare-and-hset "Experimental."
+  (let [script (enc/slurp-resource "lua/cas-hset.lua")]
+    (fn self
+      ([k field old-val ?sha new-val]
+       (lua script {:k k}
+         {:field    field
+          :old-?sha (or ?sha "")
+          :old-?val (if ?sha "" old-val)
+          :new-val  new-val}))
 
-      1. The underlying persistent connection to facilitate `close-listener` and
-         `with-open-listener`.
-      2. An atom containing the function given to handle incoming server
-         messages.
-      3. An atom containing any other optional listener state.
+      ([k field old-val new-val]
+       (let [[?sha raw-bs] (prep-cas-old-val old-val)]
+         (self k field raw-bs ?sha new-val))))))
 
-  Useful for pub/sub, monitoring, etc."
-  [conn-spec handler initial-state & body]
-  `(let [handler-atom# (atom ~handler)
-         state-atom#   (atom ~initial-state)
-         conn# (conns/make-new-connection
-                (assoc (conns/conn-spec ~conn-spec) :listener? true))
-         in#   (:in-stream conn#)]
+(comment
+  (wcar {} (del "cas-k") (set "cas-k" 0) (compare-and-set "cas-k" 0 1))
+  (wcar {} (compare-and-set "cas-k" 1 2))
+  (wcar {} (get "cas-k"))
 
-     (future-call ; Thread to long-poll for messages
-      (bound-fn []
-        (while true ; Closes when conn closes
-          (let [reply# (protocol/get-basic-reply in# false)]
-            (try
-              (@handler-atom# reply# @state-atom#)
-              (catch Throwable t#
-                (timbre/error t# "Listener handler exception")))))))
+  (wcar {} (del "cas-k") (hset "cas-k" "field" 0) (compare-and-hset "cas-k" "field" 0 1))
+  (wcar {} (compare-and-hset "cas-k" "field" 1 2))
+  (wcar {} (hget "cas-k" "field")))
 
-     (protocol/with-context conn#
-       (protocol/with-listener-req-mode ~@body))
-     (->Listener conn# handler-atom# state-atom#)))
+(def swap "Experimental."
+  (let [cas-get (let [script (enc/slurp-resource "lua/cas-get.lua")]
+                  (fn [k] (lua script {:k k} {})))]
+    (fn [k f & [nmax-attempts abort-val]]
+      (loop [idx 1]
+        (let [[old-val ex sha]     (parse nil (with-replies (cas-get k)))
+              nx?                  (= ex 0)
+              ?sha                 (when-not (= sha "") sha)
+              [new-val return-val] (enc/-vswapped (f old-val nx?))
+              cas-success?         (= 1 (parse nil
+                                          (with-replies
+                                            (if nx?
+                                              (setnx k new-val)
+                                              (compare-and-set k old-val
+                                                ?sha new-val)))))]
+          (if cas-success?
+            (return return-val)
+            (if (or (nil? nmax-attempts) (< idx (long nmax-attempts)))
+              (recur (inc idx))
+              (return abort-val))))))))
 
-(defmacro with-open-listener
-  "Evaluates body within the context of given listener's preexisting persistent
-  connection."
-  [listener & body]
-  `(protocol/with-context (:connection ~listener)
-     (protocol/with-listener-req-mode ~@body)))
+(def hswap "Experimental."
+  (let [cas-hget (let [script (enc/slurp-resource "lua/cas-hget.lua")]
+                   (fn [k field] (lua script {:k k} {:field field})))]
+    (fn [k field f & [nmax-attempts abort-val]]
+      (loop [idx 1]
+        (let [[old-val ex sha]     (parse nil (with-replies (cas-hget k field)))
+              nx?                  (= ex 0)
+              ?sha                 (when-not (= sha "") sha)
+              [new-val return-val] (enc/-vswapped (f old-val nx?))
+              cas-success?         (= 1 (parse nil
+                                          (with-replies
+                                            (if nx?
+                                              (hsetnx k field new-val)
+                                              (compare-and-hset k field old-val
+                                                ?sha new-val)))))]
+          (if cas-success?
+            (return return-val)
+            (if (or (nil? nmax-attempts) (< idx (long nmax-attempts)))
+              (recur (inc idx))
+              (return abort-val))))))))
 
-(defn close-listener [listener] (conns/close-conn (:connection listener)))
+(comment (enc/qb 100 (wcar {} (swap "swap-k" (fn [?old _] ?old)))))
 
-(defmacro with-new-pubsub-listener
-  "A wrapper for `with-new-listener`. Creates a persistent connection to Redis
-  server and a thread to listen for published messages from channels that we'll
-  subscribe to using `p/subscribe` commands in body.
+;;;;
 
-  While listening, incoming messages will be dispatched by source (channel or
-  pattern) to the given message-handler functions:
+(defn reduce-scan
+  "For use with `scan`, `zscan`, etc. Takes:
+    - (fn rf      [acc scan-result]) -> next accumulator
+    - (fn scan-fn [cursor]) -> next scan result"
+  ([rf          scan-fn] (reduce-scan rf nil scan-fn))
+  ([rf acc-init scan-fn]
+   (loop [cursor "0" acc acc-init]
+     (let [[next-cursor in] (scan-fn cursor)]
+       (if (= next-cursor "0")
+         (rf acc in)
+         (recur next-cursor (rf acc in)))))))
 
-       {\"channel1\" (fn [message] (prn \"Channel match: \" message))
-        \"user*\"    (fn [message] (prn \"Pattern match: \" message))}
-
-  SUBSCRIBE message:  `[\"message\" channel payload]`
-  PSUBSCRIBE message: `[\"pmessage\" pattern matching-channel payload]`
-
-  Returns the Listener to allow manual closing and adjustments to
-  message-handlers."
-  [conn-spec message-handlers & subscription-commands]
-  `(with-new-listener (assoc ~conn-spec :pubsub-listener? true)
-
-     ;; Message handler (fn [message state])
-     (fn [[_# source-channel# :as incoming-message#] msg-handlers#]
-       (when-let [f# (clojure.core/get msg-handlers# source-channel#)]
-         (f# incoming-message#)))
-
-     ~message-handlers ; Initial state
-     ~@subscription-commands))
+(comment
+  (reduce-scan (fn rf [acc in] (into acc in))
+    [] (fn scan-fn [cursor] (wcar {} (scan cursor)))))
 
 ;;;; Deprecated
 
-(def hash-script script-hash)
+(enc/deprecated
+  (def as-long   "DEPRECATED: Use `as-int` instead."   as-int)
+  (def as-double "DEPRECATED: Use `as-float` instead." as-float)
+  (defmacro parse-long "DEPRECATED: Use `parse-int` instead."
+    [& body] `(parse as-long   ~@body))
+  (defmacro parse-double "DEPRECATED: Use `parse-float` instead."
+    [& body] `(parse as-double ~@body))
 
-(defn kname "DEPRECATED: Use `key` instead. `key` does not filter nil parts."
-  [& parts] (apply key (filter identity parts)))
+  (def hash-script "DEPRECATED: Use `script-hash` instead." script-hash)
 
-(comment (kname :foo/bar :baz "qux" nil 10))
+  (defn kname "DEPRECATED: Use `key` instead. `key` does not filter nil parts."
+    [& parts] (apply key (filter identity parts)))
 
-(def serialize "DEPRECATED: Use `freeze` instead." freeze)
-(def preserve  "DEPRECATED: Use `freeze` instead." freeze)
-(def remember  "DEPRECATED: Use `return` instead." return)
-(def ^:macro skip-replies "DEPRECATED: Use `with-replies` instead." #'with-replies)
-(def ^:macro with-reply   "DEPRECATED: Use `with-replies` instead." #'with-replies)
-(def ^:macro with-parser  "DEPRECATED: Use `parse` instead."        #'parse)
+  (comment (kname :foo/bar :baz "qux" nil 10))
 
-(defn lua-script "DEPRECATED: Use `lua` instead." [& args] (apply lua args))
+  (def serialize "DEPRECATED: Use `freeze` instead." freeze)
+  (def preserve  "DEPRECATED: Use `freeze` instead." freeze)
+  (def remember  "DEPRECATED: Use `return` instead." return)
+  (def ^:macro skip-replies "DEPRECATED: Use `with-replies` instead." #'with-replies)
+  (def ^:macro with-reply   "DEPRECATED: Use `with-replies` instead." #'with-replies)
+  (def ^:macro with-parser  "DEPRECATED: Use `parse` instead."        #'parse)
 
-(defn make-keyfn "DEPRECATED: Use `kname` instead."
-  [& prefix-parts]
-  (let [prefix (when (seq prefix-parts) (str (apply kname prefix-parts) ":"))]
-    (fn [& parts] (str prefix (apply kname parts)))))
+  (defn lua-script "DEPRECATED: Use `lua` instead." [& args] (apply lua args))
 
-(defn make-conn-pool "DEPRECATED: Use `wcar` instead."
-  [& opts] (conns/conn-pool (apply hash-map opts)))
+  (defn make-keyfn "DEPRECATED: Use `kname` instead."
+    [& prefix-parts]
+    (let [prefix (when (seq prefix-parts) (str (apply kname prefix-parts) ":"))]
+      (fn [& parts] (str prefix (apply kname parts)))))
 
-(defn make-conn-spec "DEPRECATED: Use `wcar` instead."
-  [& opts] (conns/conn-spec (apply hash-map opts)))
+  (defn make-conn-pool "DEPRECATED: Use `wcar` instead."
+    [& opts] (conns/conn-pool (apply hash-map opts)))
 
-(defmacro with-conn "DEPRECATED: Use `wcar` instead."
-  [connection-pool connection-spec & body]
-  `(wcar {:pool ~connection-pool :spec ~connection-spec} ~@body))
+  (defn make-conn-spec "DEPRECATED: Use `wcar` instead."
+    [& opts] (conns/conn-spec (apply hash-map opts)))
 
-(defmacro atomically "DEPRECATED: Use `atomic` instead."
-  [watch-keys & body]
-  `(do
-     (with-replies ; discard "OK" and "QUEUED" replies
-       (when-let [wk# (seq ~watch-keys)] (apply watch wk#))
-       (multi)
-       ~@body)
+  (defmacro with-conn "DEPRECATED: Use `wcar` instead."
+    [connection-pool connection-spec & body]
+    `(wcar {:pool ~connection-pool :spec ~connection-spec} ~@body))
 
-     ;; Body discards will result in an (exec) exception:
-     (parse (parser-comp protocol/*parser*
-                         (-> #(if (instance? Exception %) [] %)
-                             (with-meta {:parse-exceptions? true})))
-            (exec))))
+  (defmacro atomically "DEPRECATED: Use `atomic` instead."
+    [watch-keys & body]
+    `(do
+       (with-replies ; discard "OK" and "QUEUED" replies
+         (when-let [wk# (seq ~watch-keys)] (apply watch wk#))
+         (multi)
+         ~@body)
 
-(defmacro ensure-atomically "DEPRECATED: Use `atomic` instead."
-  [{:keys [max-tries] :or {max-tries 100}}
-   watch-keys & body]
-  `(let [watch-keys# ~watch-keys
-         max-idx#    ~max-tries]
-     (loop [idx# 0]
-       (let [result# (with-replies (atomically watch-keys# ~@body))]
-         (if (not= [] result#)
-           (remember result#)
-           (if (= idx# max-idx#)
-             (throw (Exception. (str "`ensure-atomically` failed after " idx#
-                                     " attempts")))
-             (recur (inc idx#))))))))
+       ;; Body discards will result in an (exec) exception:
+       (parse (parser-comp protocol/*parser*
+                (-> #(if (instance? Exception %) [] %)
+                  (with-meta {:parse-exceptions? true})))
+         (exec))))
 
-(defn hmget* "DEPRECATED: Use `parse-map` instead."
-  [key field & more]
-  (let [fields (cons field more)
-        inner-parser (when-let [p protocol/*parser*] #(mapv p %))
-        outer-parser #(zipmap fields %)]
-    (->> (apply hmget key fields)
-         (parse (parser-comp outer-parser inner-parser)))))
+  (defmacro ensure-atomically "DEPRECATED: Use `atomic` instead."
+    [{:keys [max-tries] :or {max-tries 100}}
+     watch-keys & body]
+    `(let [watch-keys# ~watch-keys
+           max-idx#    ~max-tries]
+       (loop [idx# 0]
+         (let [result# (with-replies (atomically watch-keys# ~@body))]
+           (if-not (nil? result#) ; Was [] with < Carmine v3
+             (remember result#)
+             (if (= idx# max-idx#)
+               (throw
+                 (ex-info (format "`ensure-atomically` failed after %s attempt(s)"
+                            idx#)
+                   {:nattempts idx#}))
+               (recur (inc idx#))))))))
 
-(defn hgetall* "DEPRECATED: Use `parse-map` instead."
-  [key & [keywordize?]]
-  (let [keywordize-map (fn [m] (reduce-kv (fn [m k v] (assoc m (keyword k) v))
-                                         {} (or m {})))
-        inner-parser (when-let [p protocol/*parser*] #(mapv p %))
-        outer-parser (if keywordize?
-                       #(keywordize-map (apply hash-map %))
-                       #(apply hash-map %))]
-    (->> (hgetall key)
-         (parse (parser-comp outer-parser inner-parser)))))
+  (defn hmget* "DEPRECATED: Use `parse-map` instead."
+    [key field & more]
+    (let [fields (cons field more)
+          inner-parser (when-let [p protocol/*parser*] #(mapv p %))
+          outer-parser #(zipmap fields %)]
+      (->> (apply hmget key fields)
+        (parse (parser-comp outer-parser inner-parser)))))
 
-(comment (wcar {} (hmset* "hkey" {:a "aval" :b "bval" :c "cval"}))
-         (wcar {} (hmset* "hkey" {})) ; ex
-         (wcar {} (hmget* "hkey" :a :b))
-         (wcar {} (parse str/upper-case (hmget* "hkey" :a :b)))
-         (wcar {} (hmget* "hkey" "a" "b"))
-         (wcar {} (hgetall* "hkey"))
-         (wcar {} (parse str/upper-case (hgetall* "hkey"))))
+  (defn hgetall* "DEPRECATED: Use `parse-map` instead."
+    [key & [keywordize?]]
+    (let [inner-parser (when-let [p protocol/*parser*] #(mapv p %))
+          outer-parser (if keywordize?
+                         #(enc/map-keys keyword (apply hash-map %))
+                         #(apply hash-map %))]
+      (->> (hgetall key)
+        (parse (parser-comp outer-parser inner-parser)))))
+
+  (comment
+    (wcar {} (hgetall* "hkey"))
+    (wcar {} (parse (fn [kvs] (enc/reduce-kvs assoc {} kvs))
+               (hgetall "hkey")))
+
+    (wcar {} (hmset* "hkey" {:a "aval" :b "bval" :c "cval"}))
+    (wcar {} (hmset* "hkey" {})) ; ex
+    (wcar {} (hmget* "hkey" :a :b))
+    (wcar {} (parse str/upper-case (hmget* "hkey" :a :b)))
+    (wcar {} (hmget* "hkey" "a" "b"))
+    (wcar {} (hgetall* "hkey"))
+    (wcar {} (parse str/upper-case (hgetall* "hkey"))))
+
+  (defn as-map [x] (enc/as-map x))
+  (defmacro parse-map [form & [kf vf]]
+    `(parse #(enc/as-map % ~kf ~vf) ~form)))
