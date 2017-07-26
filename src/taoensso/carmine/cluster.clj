@@ -49,8 +49,32 @@
 ;;   Parsers & other goodies will just work as expected since all that info is
 ;;   attached to the requests themselves.
 
+;;; Cache data structure and functions
+
+(defprotocol async-cache
+  (get-item [this i] "Retrieve item by index")
+  (update-one! [this i value] "Update item at index, return true if modified")
+  (update-all! [this info] "Replace the entire cache"))
+
+(defrecord VectorAsyncCache [x]
+  async-cache
+  (get-item [this i] (get x i))
+  (update-one! [this i value] (swap! x (fn [y] (assoc y i value))))
+  (update-all! [this info] (do))) ;TODO
+
 ;; {<name> {<keyslot> <conn-spec>}}
 (def ^:private cached-keyslot-conn-specs (atom {}))
+
+;;; util
+
+(defn singleton-future
+  [lock f]
+  (if (compare-and-set! lock false true)
+    (future
+      f
+      (reset! lock false))
+    nil))
+
 
 (defn retryable? [obj]
   (= (:prefix (ex-data obj)) :moved))
