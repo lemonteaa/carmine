@@ -104,6 +104,33 @@
     e))
 
 
+(defn parse-slots [s]
+  (when-not (re-find #"^\[" s)
+	(let [[start stop] (str/split s #"-")
+		  stop         (or stop start)]
+	  [(car/as-long start) (car/as-long stop)])))
+
+(defn parse-spec [addr]
+  (let [[host port] (str/split addr #":")
+		bound-spec  (get-in protocol/*context* [:conn :spec])]
+	(if (str/blank? host)
+	  bound-spec
+	  (merge bound-spec {:host host :port (car/as-long port)}))))
+
+(defn parse-cluster-node [s]
+  (let [fields (str/split s #" ")
+		[name addr flags master-id ping-sent ping-recv config-epoch link-status & slots] fields
+		spec (parse-spec addr)]
+	{:spec      (parse-spec addr)
+	 :slots     (map parse-slots slots)
+	 :flags     (set (map keyword (str/split flags #",")))
+	 :replicate (if (= master-id "-") false master-id)
+	 :ping-sent (car/as-long ping-sent)
+	 :ping-recv (car/as-long ping-recv)}))
+
+
+;;----
+
 (defn retryable? [obj]
   (= (:prefix (ex-data obj)) :moved))
 
@@ -237,13 +264,6 @@
 	  (get-in (swap! slot-cache assoc-in [cluster slot] {:spec spec :cluster cluster})
 			  [cluster slot]))
 
-	(defn parse-spec [addr]
-	  (let [[host port] (str/split addr #":")
-			bound-spec  (get-in protocol/*context* [:conn :spec])]
-		(if (str/blank? host)
-		  bound-spec
-		  (merge bound-spec {:host host :port (car/as-long port)}))))
-
 	(defn parse-redirect [error]
 	  (let [[error slot address] (str/split error #" ")]
 		[(car/as-long slot) (parse-spec address)]))
@@ -285,23 +305,6 @@
 		 (vector ~@sigs)))
 
 	(comment (ccar {:spec {:host "127.0.0.1" :port 7001} :cluster "my-cluster"} (car/get "foo")))
-
-	(defn parse-slots [s]
-	  (when-not (re-find #"^\[" s)
-		(let [[start stop] (str/split s #"-")
-			  stop         (or stop start)]
-		  [(car/as-long start) (car/as-long stop)])))
-
-	(defn parse-cluster-node [s]
-	  (let [fields (str/split s #" ")
-			[name addr flags master-id ping-sent ping-recv config-epoch link-status & slots] fields
-			spec (parse-spec addr)]
-		{:spec      (parse-spec addr)
-		 :slots     (map parse-slots slots)
-		 :flags     (set (map keyword (str/split flags #",")))
-		 :replicate (if (= master-id "-") false master-id)
-		 :ping-sent (car/as-long ping-sent)
-		 :ping-recv (car/as-long ping-recv)}))
 
 	(defn cluster-nodes*
 	  "Queries the current list of cluster nodes."
