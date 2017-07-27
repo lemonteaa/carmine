@@ -75,6 +75,34 @@
       (reset! lock false))
     nil))
 
+; see https://stackoverflow.com/questions/9638271/update-the-values-of-multiple-keys
+(defn update-vals [map vals f]
+  "Update multiple values in map"
+  (reduce #(update-in % [%2] f) map vals))
+
+(defn ranges [rs]
+  "Enumerate all items in a list of ranges"
+  (mapcat (partial apply #(range %1 (inc %2))) rs))
+
+(defn as-slots-array [nodes]
+  (reduce (fn [acc node]
+            (update-vals acc (ranges (:slots node))
+                         #(conj % (:spec node))))
+          (vec (repeat 16384 ()))
+          nodes))
+
+(defn cluster-err [e]
+  "Parse exceptions for MOVED and ASK by adding redirect info to ex-data"
+  { :parse-exceptions? true }
+  (case (:prefix (ex-data e))
+        (:moved :ask) (let [[_ slot addr] (str/split (.getMessage e) #" ")
+                            [host port]   (str/split addr #":")
+                            port          (car/as-long port)]
+                        (ex-info (.getMessage e)
+                                 (merge (ex-data e)
+                                        {:loc {:host host :port port} :slot slot})))
+    e))
+
 
 (defn retryable? [obj]
   (= (:prefix (ex-data obj)) :moved))
