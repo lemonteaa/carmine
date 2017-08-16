@@ -81,9 +81,18 @@
 ;;   whether it comes from primary or secondary cache, and this info need to be
 ;;   passed along until response is received.
 ;;
+;; * (Amendment) Actually even this won't prove it, as it is possible for the
+;;   delay to the response be so long, we passed through one complete primary
+;;   cache update cycle in the interim. So add a version number to the primary
+;;   cache and also update it alongside other data atomically?
+;;
 ;; Note: CLUSTER NODES is used even though CLUSTER SLOTS is available, I guess
 ;;       this is for backward compatibility? (the latter command is only added
 ;;       in some newish version)
+;; Note: We also need some way to ensure we won't be triggering multiple futures
+;;       at the same time, probably some kind of lock...
+;; Note to self: concurrent programming is tricky, especially when you think
+;;               you've got all bases covered.
 
 
 (comment
