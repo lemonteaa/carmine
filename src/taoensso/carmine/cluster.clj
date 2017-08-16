@@ -49,7 +49,44 @@
 ;;   Parsers & other goodies will just work as expected since all that info is
 ;;   attached to the requests themselves.
 
+
 ;;; Cache data structure and functions
+;; Current design:
+;; * The primary cache holds the result of the latest known result from a
+;;   CLUSTER NODES call, while the secondary cache holds latest known location
+;;   of particular slots informed by MOVED response only.
+;; * When everything is working data from primary cache is always used.
+;; * When it is proven (see below) that primary cache is outdated, we change
+;;   the state of primary cache to updating, starts a future to call
+;;   CLUSTER NODES again (per redis's recommendation), and meanwhile rely on
+;;   the secondary cache (falling back to primary if no record is found).
+;; * In this phase responses of type MOVED will update the secondary cache
+;;   (In case this isn't obvious ;) )
+;; * When CLUSTER NODES returned we atomically update it and change the state
+;;   back to normal, so primary cache will be used again.
+;; * We need to be careful about when should the primary cache be updated
+;;   because everythings are async and the arrival order of messages doesn't
+;;   imply anything about the order of remote events except those deducible
+;;   from local order of messages (eg if message B is sent after response of
+;;   message A is received, we can deduce that whatever action A performs is
+;;   already done by the time B arrived)
+;; * In particular, one easy but deadly way to fail is to update whenever a
+;;   MOVED message is received when primary cache is in normal state. It could
+;;   be that the MOVED message is really sent when primary cache is updating,
+;;   but message arrival has been delayed. In the worst case this will make
+;;   the primary cache into a perpetual state of updating.
+;; * Instead, we update only if a MOVED response is received in response to
+;;   a message sent using slot information from primary cache *in normal state*.
+;; * Because of this when retriving item we should also include information on
+;;   whether it comes from primary or secondary cache, and this info need to be
+;;   passed along until response is received.
+;;
+;; Note: CLUSTER NODES is used even though CLUSTER SLOTS is available, I guess
+;;       this is for backward compatibility? (the latter command is only added
+;;       in some newish version)
+
+
+(comment
 
 (defprotocol async-cache
   (get-item [this i] "Retrieve item by index")
@@ -61,6 +98,7 @@
   (get-item [this i] (get x i))
   (update-one! [this i value] (swap! x (fn [y] (assoc y i value))))
   (update-all! [this info] (do))) ;TODO
+)
 
 ;; {<name> {<keyslot> <conn-spec>}}
 (def ^:private cached-keyslot-conn-specs (atom {}))
