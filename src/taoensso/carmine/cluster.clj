@@ -78,8 +78,8 @@
 ;; * Instead, we update only if a MOVED response is received in response to
 ;;   a message sent using slot information from primary cache *in normal state*.
 ;; * Because of this when retriving item we should also include information on
-;;   whether it comes from primary or secondary cache, and this info need to be
-;;   passed along until response is received.
+;;   whether it comes from a normal state, and this info need to be passed along
+;;   until response is received.
 ;;
 ;; * (Amendment) Actually even this won't prove it, as it is possible for the
 ;;   delay to the response be so long, we passed through one complete primary
@@ -97,32 +97,53 @@
 ;;               you've got all bases covered.
 
 
-(comment
+(def num-slots 10)
+(def cache (atom { :state :normal :version 0 :primary-data (vec (repeat num-slots nil)) :secondary-data (vec (repeat num-slots nil)) }))
+(def update-requests-agent (agent 0))
 
-(defprotocol async-cache
-  (get-item [this i] "Retrieve item by index")
-  (update-one! [this i value] "Update item at index, return true if modified")
-  (update-all! [this info] "Replace the entire cache"))
+(defn refresh-cache! [data ver]
+  (reset! cache { :state :normal :version ver :primary-data data :secondary-data (vec (repeat num-slots nil))}))
 
-(defrecord VectorAsyncCache [x]
-  async-cache
-  (get-item [this i] (get x i))
-  (update-one! [this i value] (swap! x (fn [y] (assoc y i value))))
-  (update-all! [this info] (do))) ;TODO
-)
+;TODO
+(defn cluster-nodes-request [version expected-version]
+  (if (= version expected-version)
+    (do
+      (print "(Mock) Sending request...")
+      (Thread/sleep (+ 500 (rand-int 3000)))
+      (println "done.")
+      (refresh-cache! (vec (repeat num-slots {:ip "128.128.1.75" :port "80" })) (inc version))
+      (inc version))
+    version))
+
+(defn get-cache [slot]
+  (let [{:keys [state version primary-data secondary-data]} @cache]
+       (if (= state :normal)
+           [:normal version (get primary-data slot)]
+           (if-let [val (get secondary-data slot)]
+                   [:updating version val]
+                   [:updating version (get primary-data slot)]))))
+
+(defn swap-cache! [version slot node]
+  (let [result (swap! cache (fn [c version slot node]
+                                (if (= version (:version c))
+                                    (-> c
+                                        (assoc :state :updating)
+                                        (assoc-in [:secondary-data slot] node))
+                                    c))
+                      version slot node)]
+    (:version result)))
+
+(defn update-cache! [state version slot node]
+  (if (= state :normal)
+      (if (= version (swap-cache! version slot node))
+          (send-off update-requests-agent cluster-nodes-request version))
+      (swap-cache! version slot node)))
+
 
 ;; {<name> {<keyslot> <conn-spec>}}
 (def ^:private cached-keyslot-conn-specs (atom {}))
 
 ;;; util
-
-(defn singleton-future
-  [lock f]
-  (if (compare-and-set! lock false true)
-    (future
-      f
-      (reset! lock false))
-    nil))
 
 ; see https://stackoverflow.com/questions/9638271/update-the-values-of-multiple-keys
 (defn update-vals [map vals f]
