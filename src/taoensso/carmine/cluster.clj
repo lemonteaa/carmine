@@ -57,7 +57,7 @@
 ;;   of particular slots informed by MOVED response only.
 ;; * When everything is working data from primary cache is always used.
 ;; * When it is proven (see below) that primary cache is outdated, we change
-;;   the state of primary cache to updating, starts a future to call
+;;   the state of primary cache to updating, asynchronously call
 ;;   CLUSTER NODES again (per redis's recommendation), and meanwhile rely on
 ;;   the secondary cache (falling back to primary if no record is found).
 ;; * In this phase responses of type MOVED will update the secondary cache
@@ -86,11 +86,13 @@
 ;;   cache update cycle in the interim. So add a version number to the primary
 ;;   cache and also update it alongside other data atomically?
 ;;
+;; * (Addition) To avoid triggering multiple call to redis, we will use clojure's
+;;   agent system. Similarly all states above will be put into a single atom
+;;   to ensure that all state transitions are... well, atomic.
+;;
 ;; Note: CLUSTER NODES is used even though CLUSTER SLOTS is available, I guess
 ;;       this is for backward compatibility? (the latter command is only added
 ;;       in some newish version)
-;; Note: We also need some way to ensure we won't be triggering multiple futures
-;;       at the same time, probably some kind of lock...
 ;; Note to self: concurrent programming is tricky, especially when you think
 ;;               you've got all bases covered.
 
